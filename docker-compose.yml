@@ -1,0 +1,43 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: finsight_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: finsight
+      MYSQL_USER: finsight_user
+      MYSQL_PASSWORD: finsight_password
+      TZ: Asia/Singapore
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      # 宿主机用 3308，避免和本机已有 MySQL 的 3306 冲突。
+      # 容器内部后端仍然通过 db:3306 访问。
+      - "3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -ufinsight_user -pfinsight_password --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  backend:
+    build: .
+    container_name: finsight_backend
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8002:8000"
+    volumes:
+      - .:/app
+
+volumes:
+  mysql_data:

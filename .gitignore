@@ -1,0 +1,101 @@
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# =========================
+# Python build / package
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+.finsight/
+.conda/
+*.env/
+
+# =========================
+# Environment files
+# =========================
+.env
+.env.local
+.env.dev
+.env.prod
+.env.docker
+
+# 允许提交示例配置
+!.env.example
+!.env.docker.example
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+app.log
+
+# =========================
+# Test / coverage
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+api_test_results/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# =========================
+# Docker local data
+# =========================
+mysql_data/
+docker/mysql_data/
+*.pid
+
+# =========================
+# Local database / temp files
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+tmp/
+temp/
+.cache/
+
+# =========================
+# Model files / large artifacts
+# 如果以后有模型文件，建议不要直接上传 Git
+# =========================
+models_artifacts/
+artifacts/
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
