@@ -62,7 +62,18 @@ def latest_final_positions(include_empty: bool = True, db: Session = Depends(get
     )
     if not run:
         if include_empty:
-            return ok({"user_id": user.id, "run_id": None, "positions": []})
+            # 返回稳定字段，避免前端在空结果场景下缺字段报错。
+            return ok({
+                "user_id": user.id,
+                "run_id": None,
+                "run_name": None,
+                "snapshot_date": None,
+                "total_value": None,
+                "cash": None,
+                "stock_value": None,
+                "total_return": None,
+                "positions": [],
+            })
         from app.core.exceptions import AppException, BACKTEST_FINAL_POSITION_NOT_FOUND
         raise AppException(BACKTEST_FINAL_POSITION_NOT_FOUND, "当前用户没有已完成回测最终持仓。", 404)
     data = final_positions(db, run)

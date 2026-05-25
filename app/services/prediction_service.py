@@ -51,6 +51,20 @@ def _model_version_name(db: Session, model_id: int | None) -> str | None:
     return model.version_name if model else None
 
 
+def _infer_model_match_status(db: Session, pred: Prediction) -> str:
+    """为历史预测详情补齐模型匹配状态。
+
+    run_prediction 新生成预测时会直接传入 model_match_status；
+    但历史详情查询只保存了 model_version_id，因此需要根据预测周期和模型周期动态推断。
+    """
+    classifier = db.query(ModelVersion).filter(ModelVersion.id == pred.model_version_id).first() if pred.model_version_id else None
+    if not classifier:
+        return "placeholder_no_active_model"
+    if classifier.horizon_days == pred.forecast_days:
+        return "exact_match"
+    return "nearest_active_model"
+
+
 def _recommendation_level(score: float) -> str:
     if score >= 85:
         return "strong"
@@ -224,7 +238,7 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
         "coverage_status": "core_pool" if stock and stock.is_core_pool else "supported" if stock and stock.is_supported else "unknown",
         "model_version": _model_version_name(db, pred.model_version_id),
         "reg_model_version": _model_version_name(db, pred.reg_model_version_id),
-        "model_match_status": model_match_status,
+        "model_match_status": model_match_status or _infer_model_match_status(db, pred),
         "request_params": pred.request_params_json,
         "current_price": float(pred.current_price) if pred.current_price is not None else None,
         "classification": {

@@ -19,6 +19,7 @@ from app.services.stock_service import (
     news_query,
     get_news_or_404,
     display_change_percent,
+    stock_data_status,
 )
 
 router = APIRouter(prefix="/api/stocks", tags=["Stock API"])
@@ -45,7 +46,11 @@ def search(
                     "exchange": s.exchange,
                     "listing_source": s.listing_source,
                     "etf": s.etf,
-                    "is_supported": s.is_supported,
+                    # is_supported 面向前端使用：只有基础库标记支持且已有行情数据时才返回 true。
+                    # 原始股票基础库支持状态可通过 raw_is_supported 查看。
+                    "is_supported": s.is_supported and stock_data_status(db, s) == "ready",
+                    "raw_is_supported": s.is_supported,
+                    "data_status": stock_data_status(db, s),
                 }
                 for s in items
             ],
@@ -90,7 +95,23 @@ def stock_detail(
             for i in indicators
         ]
 
-    current_quote = None
+    data_status = stock_data_status(db, stock)
+    current_quote = {
+        "current_price": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "previous_close": None,
+        "change": None,
+        "change_percent": None,
+        "daily_return": None,
+        "amplitude": None,
+        "fifty_two_week_high": high52,
+        "fifty_two_week_low": low52,
+        "volume": None,
+        "trading_date": None,
+    }
     if latest:
         current_quote = {
             "current_price": float(latest.close) if latest.close is not None else None,
@@ -115,6 +136,9 @@ def stock_detail(
             "company_name": stock.company_name,
             "market": stock.market,
             "sector": None,
+            "is_supported": stock.is_supported and data_status == "ready",
+            "raw_is_supported": stock.is_supported,
+            "data_status": data_status,
             "current_quote": current_quote,
             "price_curve": [
                 {
@@ -137,8 +161,8 @@ def stock_detail(
                     "summary": n.summary,
                     "source": n.source,
                     "publish_time": n.publish_time.isoformat() if n.publish_time else None,
-                    "sentiment_score": n.sentiment_score,
-                    "sentiment_label": n.sentiment_label,
+                    "sentiment_score": n.sentiment_score if n.sentiment_score is not None else 0.0,
+                    "sentiment_label": n.sentiment_label or "neutral",
                 }
                 for n in latest_news
             ],
@@ -175,8 +199,8 @@ def stock_news(
                     "url": n.url,
                     "publish_time": n.publish_time.isoformat() if n.publish_time else None,
                     "assigned_trading_date": n.assigned_trading_date.isoformat() if n.assigned_trading_date else None,
-                    "sentiment_score": n.sentiment_score,
-                    "sentiment_label": n.sentiment_label,
+                    "sentiment_score": n.sentiment_score if n.sentiment_score is not None else 0.0,
+                    "sentiment_label": n.sentiment_label or "neutral",
                     "has_detail": bool(n.content_text or n.content_html or n.news_llm_analysis),
                 }
                 for n in items
@@ -201,8 +225,8 @@ def news_detail(news_id: int, include_html: bool = False, db: Session = Depends(
             "url": n.url,
             "publish_time": n.publish_time.isoformat() if n.publish_time else None,
             "assigned_trading_date": n.assigned_trading_date.isoformat() if n.assigned_trading_date else None,
-            "sentiment_score": n.sentiment_score,
-            "sentiment_label": n.sentiment_label,
+            "sentiment_score": n.sentiment_score if n.sentiment_score is not None else 0.0,
+            "sentiment_label": n.sentiment_label or "neutral",
             "news_llm_analysis": n.news_llm_analysis,
             "content_status": n.content_status,
             "content_fetched_at": n.content_fetched_at.isoformat() if n.content_fetched_at else None,

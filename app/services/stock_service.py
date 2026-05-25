@@ -1,7 +1,7 @@
 """股票、行情、新闻查询服务。"""
 
 from datetime import datetime, timedelta
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import AppException, DATA_NOT_FOUND, INVALID_TICKER, NEWS_NOT_FOUND
@@ -38,15 +38,73 @@ def get_stock_or_404(db: Session, ticker: str) -> Stock:
 
 
 def search_stocks(db: Session, keyword: str, only_supported: bool, include_etf: bool, limit: int) -> tuple[list[Stock], int]:
-    kw = f"%{keyword.strip()}%"
-    q = db.query(Stock).filter(or_(Stock.ticker.ilike(kw), Stock.company_name.ilike(kw), Stock.security_name.ilike(kw)))
+    """搜索股票基础库。
+
+    排序规则专门为前端联想搜索优化：
+    1. ticker 完全等于关键词的结果排第一，例如搜索 AAPL 时 Apple Inc. 优先于 AAPB；
+    2. ticker 以关键词开头的结果优先；
+    3. 当前系统支持分析的证券优先；
+    4. 普通股优先于 ETF；
+    5. 核心股票池优先。
+    """
+    raw_keyword = keyword.strip()
+    kw = f"%{raw_keyword}%"
+    keyword_upper = raw_keyword.upper()
+
+    q = db.query(Stock).filter(
+        or_(
+            Stock.ticker.ilike(kw),
+            Stock.company_name.ilike(kw),
+            Stock.security_name.ilike(kw),
+        )
+    )
     if only_supported:
         q = q.filter(Stock.is_supported.is_(True))
     if not include_etf:
         q = q.filter(or_(Stock.etf.is_(False), Stock.etf.is_(None)))
+
     total = q.count()
-    items = q.order_by(Stock.is_supported.desc(), Stock.ticker.asc()).limit(min(limit, 100)).all()
+
+    exact_ticker_rank = case((func.upper(Stock.ticker) == keyword_upper, 0), else_=1)
+    prefix_ticker_rank = case((func.upper(Stock.ticker).like(f"{keyword_upper}%"), 0), else_=1)
+    supported_rank = case((Stock.is_supported.is_(True), 0), else_=1)
+    non_etf_rank = case((or_(Stock.etf.is_(False), Stock.etf.is_(None)), 0), else_=1)
+    core_pool_rank = case((Stock.is_core_pool.is_(True), 0), else_=1)
+
+    items = (
+        q.order_by(
+            exact_ticker_rank,
+            prefix_ticker_rank,
+            supported_rank,
+            non_etf_rank,
+            core_pool_rank,
+            Stock.ticker.asc(),
+        )
+        .limit(min(limit, 100))
+        .all()
+    )
     return items, total
+
+
+def stock_has_price_data(db: Session, ticker: str) -> bool:
+    """判断该 ticker 是否已经有可用于详情/预测/回测的行情数据。"""
+    row = latest_price(db, normalize_ticker(ticker))
+    return bool(row and row.close is not None)
+
+
+def stock_data_status(db: Session, stock: Stock) -> str:
+    """返回前端可直接理解的数据状态。
+
+    synced：只代表股票基础库中存在；
+    ready：代表已有行情数据，可支持详情、预测与回测；
+    no_price_data：基础库中存在，但当前没有足够行情数据；
+    unsupported：系统暂不支持分析该证券。
+    """
+    if not stock.is_supported:
+        return "unsupported"
+    if not stock_has_price_data(db, stock.ticker):
+        return "no_price_data"
+    return "ready"
 
 
 def latest_price(db: Session, ticker: str) -> PriceData | None:
@@ -70,7 +128,7 @@ def latest_sentiment_summary(db: Session, ticker: str) -> dict:
         return {
             "news_start_time": None,
             "news_end_time": None,
-            "sentiment_score": None,
+            "sentiment_score": 0.0,
             "sentiment_label": "neutral",
             "positive_news_count": 0,
             "negative_news_count": 0,
