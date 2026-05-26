@@ -14,6 +14,8 @@ from app.core.exceptions import AppException, DATA_NOT_FOUND, PREDICTION_NOT_FOU
 from app.models.all_models import Prediction, ModelVersion, Stock, PriceData
 from app.schemas.prediction import PredictionRunRequest
 from app.services.stock_service import get_stock_or_404, latest_price, price_curve, latest_sentiment_summary, normalize_ticker
+from app.services.model_service import load_active_model, predict_classifier, predict_regressor
+from app.services.feature_service import build_feature_dict, validate_feature_columns
 
 
 def _sigmoid(x: float) -> float:
@@ -76,54 +78,79 @@ def _recommendation_level(score: float) -> str:
 
 
 def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict:
+    """运行真实模型预测。
+
+    v1.0 接入内容：
+    - 从 model_versions 读取 active 分类模型和回归模型；
+    - 从 price_data + technical_indicators 构造特征；
+    - 调用 XGBoost 分类模型输出 up/neutral/down 概率；
+    - 调用 XGBoost 回归模型输出未来收益率路径；
+    - 生成 price_path、recommendation_score；
+    - 保存 predictions 记录并返回 v5 API 结构。
+
+    当前限制：
+    - 新闻情绪特征仍为 v1.0 占位 0；
+    - LLM 报告仍使用模板降级。
+    """
     ticker = normalize_ticker(req.ticker)
+
     stock = get_stock_or_404(db, ticker)
     if not stock.is_supported:
         raise AppException(STOCK_NOT_SUPPORTED, "该股票存在于基础库，但当前系统暂不支持分析。", 400)
 
+    # 保留原有行情检查，确保股票确实有可用于预测的行情。
     latest = latest_price(db, ticker)
     if not latest or latest.close is None:
         raise AppException(DATA_NOT_FOUND, "未能获取该股票足够历史行情数据。", 404)
 
-    current_price = float(latest.close)
-    base_date = latest.trading_date
+    # 读取 active 模型。
+    classifier_model, classifier_match_status = load_active_model(db, "classifier", req.forecast_days)
+    reg_model, reg_match_status = load_active_model(db, "regressor", req.forecast_days)
+
+    if classifier_model.feature_columns != reg_model.feature_columns:
+        raise AppException(DATA_NOT_FOUND, "分类模型与回归模型的特征列不一致，无法执行预测。", 500)
+
+    # 构造与训练时完全一致的特征。
+    feature_result = build_feature_dict(db, ticker)
+    feature_dict = feature_result["feature_dict"]
+    validate_feature_columns(feature_dict, classifier_model.feature_columns)
+
+    current_price = float(feature_result["current_price"])
+    base_date = feature_result["base_trading_date"]
+
     trading_days = _next_trading_days(base_date, req.forecast_days)
     forecast_start = trading_days[0]
     forecast_end = trading_days[-1]
 
-    # 读取最近行情，计算一个轻量趋势特征。
-    curve = price_curve(db, ticker, 20)
-    if len(curve) >= 2 and curve[0].close:
-        recent_return = (float(curve[-1].close) - float(curve[0].close)) / float(curve[0].close)
-    else:
-        recent_return = float(latest.daily_return or 0)
+    # 真实分类模型输出。
+    classification = predict_classifier(classifier_model, feature_dict)
+    predicted_label = classification["predicted_label"]
+    prob_up = classification["prob_up"]
+    prob_neutral = classification["prob_neutral"]
+    prob_down = classification["prob_down"]
 
-    sentiment = latest_sentiment_summary(db, ticker)
-    sentiment_score = float(sentiment.get("sentiment_score") or 0)
+    # 真实回归模型输出收益率路径。
+    predicted_returns = predict_regressor(reg_model, feature_dict)
+    predicted_returns = predicted_returns[: req.forecast_days]
 
-    # 占位分类逻辑：趋势 + 情绪共同影响上涨概率。
-    up_raw = 2.2 * recent_return + 0.8 * sentiment_score
-    prob_up = max(0.05, min(0.9, _sigmoid(up_raw)))
-    prob_down = max(0.05, min(0.8, _sigmoid(-up_raw) * 0.5))
-    prob_neutral = max(0.05, 1 - prob_up - prob_down)
-    total = prob_up + prob_neutral + prob_down
-    prob_up, prob_neutral, prob_down = prob_up / total, prob_neutral / total, prob_down / total
-    predicted_label = max({"up": prob_up, "neutral": prob_neutral, "down": prob_down}, key={"up": prob_up, "neutral": prob_neutral, "down": prob_down}.get)
+    volatility = float(feature_dict.get("volatility_20d", 0.0) or 0.0)
 
-    # 占位回归逻辑：根据趋势和情绪生成价格路径。
-    daily_drift = max(-0.02, min(0.02, 0.35 * recent_return / max(len(curve), 1) + 0.003 * sentiment_score))
     price_path = []
     for idx, target_day in enumerate(trading_days, start=1):
-        predicted_return = daily_drift * idx
+        predicted_return = float(predicted_returns[idx - 1])
         predicted_price = current_price * (1 + predicted_return)
+
+        # v1.0 区间：用历史 20 日波动率近似，不作为确定预测。
+        band = current_price * volatility * (idx ** 0.5)
+
         price_path.append(
             {
                 "day_index": idx,
                 "target_date": target_day.isoformat(),
-                "predicted_return": round(predicted_return, 6),
+                "predicted_return": predicted_return,
                 "predicted_price": round(predicted_price, 4),
-                "lower_bound": round(predicted_price * 0.98, 4),
-                "upper_bound": round(predicted_price * 1.02, 4),
+                "lower_bound": round(predicted_price - band, 4),
+                "upper_bound": round(predicted_price + band, 4),
             }
         )
 
@@ -131,37 +158,52 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
     max_upside = max(0.0, (max(predicted_prices) - current_price) / current_price)
     max_downside = max(0.0, (current_price - min(predicted_prices)) / current_price)
 
-    recommendation_score = max(0, min(100, prob_up * 70 + max_upside * 1200 - max_downside * 700 + sentiment_score * 10))
+    sentiment = latest_sentiment_summary(db, ticker)
+    sentiment_score = float(sentiment.get("sentiment_score") or 0.0)
+
+    recommendation_score = (
+        50
+        + (prob_up - prob_down) * 40
+        + max_upside * 300
+        - max_downside * 200
+        + sentiment_score * 10
+        - volatility * 100
+    )
+    recommendation_score = max(0, min(100, recommendation_score))
     recommendation_level = _recommendation_level(recommendation_score)
 
-    classifier_model = _active_model(db, "classifier", req.forecast_days)
-    reg_model = _active_model(db, "regressor", req.forecast_days)
-    model_match_status = "exact_match"
-    if classifier_model and classifier_model.horizon_days != req.forecast_days:
+    if classifier_match_status == reg_match_status:
+        model_match_status = classifier_match_status
+    elif "nearest_active_model" in {classifier_match_status, reg_match_status}:
         model_match_status = "nearest_active_model"
-    if not classifier_model:
-        model_match_status = "placeholder_no_active_model"
+    else:
+        model_match_status = classifier_match_status
 
     news_llm_report = (
-        "当前版本尚未接入真实大模型。模板分析：近期新闻情绪"
-        f"为 {sentiment.get('sentiment_label', 'neutral')}，综合情绪分数为 {sentiment_score:.3f}，"
-        "该信息已作为推荐分数的辅助因素。"
+        "当前版本已接入新闻情绪摘要，但尚未接入成员 C 的真实新闻 LLM 深度分析。"
+        f"近窗口新闻情绪分数为 {sentiment_score:.3f}，"
+        "该分数已参与推荐分数计算。"
     )
+
     explanations = [
-        f"最近行情趋势收益约为 {recent_return:.2%}。",
-        f"上涨概率为 {prob_up:.1%}，下跌概率为 {prob_down:.1%}。",
+        f"分类模型预测方向为 {predicted_label}。",
+        f"上涨概率为 {prob_up:.1%}，震荡概率为 {prob_neutral:.1%}，下跌概率为 {prob_down:.1%}。",
+        f"回归模型预测未来 {req.forecast_days} 个交易日最大上行空间约为 {max_upside:.2%}，最大下行空间约为 {max_downside:.2%}。",
         f"推荐购买分数为 {recommendation_score:.1f}，等级为 {recommendation_level}。",
     ]
+
     report_text = (
-        f"综合来看，{ticker} 在未来 {req.forecast_days} 个交易日的预测方向为 {predicted_label}。"
-        "当前结果由第一版占位推理服务生成，仅用于接口联调和课程项目演示，不构成真实投资建议。"
+        f"综合来看，{ticker} 在未来 {req.forecast_days} 个交易日的模型预测方向为 {predicted_label}。"
+        "本结果由当前激活的新闻增强版分类模型与回归模型生成。"
+        "当前已接入新闻情绪摘要并参与推荐分数计算，但新闻 LLM 深度分析仍为模板降级版本。"
+        "结果仅用于课程实践和模拟分析，不构成真实投资建议。"
     )
 
     pred = Prediction(
         user_id=user_id,
         ticker=ticker,
-        model_version_id=classifier_model.id if classifier_model else None,
-        reg_model_version_id=reg_model.id if reg_model else None,
+        model_version_id=classifier_model.version.id,
+        reg_model_version_id=reg_model.version.id,
         base_trading_date=base_date,
         forecast_days=req.forecast_days,
         forecast_start_date=forecast_start,
@@ -185,15 +227,21 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         },
         sentiment_summary_json=sentiment,
         news_llm_report=news_llm_report,
-        explanation_json={"main_reasons": explanations, "risk_notes": ["第一版预测服务为占位实现，后续需接入真实模型。"]},
+        explanation_json={
+            "main_reasons": explanations,
+            "risk_notes": [
+                "当前模型为 v1.0 基线模型；新闻情绪摘要已接入，但完整多股票新闻特征仍需在 v1.1 中重新训练。",
+                "预测结果仅用于课程实践和模拟分析，不构成真实投资建议。",
+            ],
+        },
         report_text=report_text,
     )
+
     db.add(pred)
     db.commit()
     db.refresh(pred)
 
     return prediction_to_detail(db, pred, model_match_status=model_match_status, saved=True)
-
 
 def prediction_to_card(db: Session, pred: Prediction) -> dict:
     stock = db.query(Stock).filter(Stock.ticker == pred.ticker).first()
