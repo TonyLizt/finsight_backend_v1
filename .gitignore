@@ -26,7 +26,9 @@ ENV/
 .finsight/
 .conda/
 *.env/
-
+noapp/
+data/
+outputs/
 # =========================
 # Environment files
 # =========================
@@ -99,3 +101,11 @@ artifacts/
 # Jupyter
 # =========================
 .ipynb_checkpoints/
+# =========================
+# Local backup files
+# =========================
+*.bak
+*.bak_*
+*.py.bak
+*.py.bak_*
+*.bak_fix_*
