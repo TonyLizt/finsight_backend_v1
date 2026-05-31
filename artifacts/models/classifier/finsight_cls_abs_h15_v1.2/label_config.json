@@ -1,0 +1,9 @@
+{
+  "candidate": "abs_h15_market_ext_logreg",
+  "task": "abs_sign",
+  "horizon": 15,
+  "label_rule": "abs_sign: label=1 if future_return_h > 0",
+  "target_return_column_generated_from": "price_data.close shifted by horizon trading days",
+  "cutoff_date": "2025-05-20",
+  "leakage_control": "Only rows whose target_date <= cutoff_date are used for final supervised training."
+}

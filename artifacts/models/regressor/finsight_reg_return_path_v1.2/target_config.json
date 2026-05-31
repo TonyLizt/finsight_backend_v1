@@ -1,0 +1,23 @@
+{
+  "model_name": "finsight_reg_return_path_v1.2",
+  "task": "return_path_regression",
+  "forecast_days": 5,
+  "target_columns": [
+    "target_return_d1",
+    "target_return_d2",
+    "target_return_d3",
+    "target_return_d4",
+    "target_return_d5"
+  ],
+  "target_horizon_days": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "prediction_unit": "future_return",
+  "price_reconstruction": "predicted_price_i = current_price * (1 + predicted_return_i)",
+  "cutoff_rule": "target_date_d5 <= cutoff_date",
+  "cutoff_date": "2025-05-20"
+}

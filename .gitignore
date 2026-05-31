@@ -109,3 +109,6 @@ artifacts/
 *.py.bak
 *.py.bak_*
 *.bak_fix_*
+
+# Local experiment workspace, do not commit
+local_experiments/

@@ -1,0 +1,35 @@
+{
+  "note": "train_metrics are fitted-sample diagnostics only; use rolling_validation_metrics for model selection.",
+  "train_metrics": {
+    "accuracy": 0.5632887189292543,
+    "macro_f1": 0.5611205512182323,
+    "precision": 0.6383601756954612,
+    "recall": 0.5518619678902138,
+    "confusion_matrix": [
+      [
+        6446,
+        4693
+      ],
+      [
+        6727,
+        8284
+      ]
+    ],
+    "positive_rate_true": 0.5740344168260039,
+    "positive_rate_pred": 0.4962523900573614
+  },
+  "rolling_validation_metrics": {
+    "candidate": "abs_h15_market_ext_logreg",
+    "task": "abs_sign",
+    "horizon": 15,
+    "feature_set": "f0_market_ext",
+    "model": "logreg",
+    "folds": 3,
+    "mean_test_accuracy": 0.6069375,
+    "mean_test_macro_f1": 0.5881228800550399,
+    "mean_above_baseline": 0.055125,
+    "min_above_baseline": 0.0028124999999999,
+    "mean_hc_test_coverage": 0.4250833333333333,
+    "mean_hc_test_accuracy": 0.6883573497899153
+  }
+}

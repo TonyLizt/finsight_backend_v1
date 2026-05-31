@@ -1,0 +1,9 @@
+{
+  "candidate": "action1p5_h10_market_ext_ridge",
+  "task": "action_1p5",
+  "horizon": 10,
+  "label_rule": "action_1p5: label=1 if future_return_h > 1.5%",
+  "target_return_column_generated_from": "price_data.close shifted by horizon trading days",
+  "cutoff_date": "2025-05-20",
+  "leakage_control": "Only rows whose target_date <= cutoff_date are used for final supervised training."
+}

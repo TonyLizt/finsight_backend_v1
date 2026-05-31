@@ -1,0 +1,29 @@
+{
+  "model_name": "finsight_reg_return_path_v1.2",
+  "model_type": "ExtraTreesRegressor",
+  "prediction_shape": [
+    1,
+    5
+  ],
+  "target_columns": [
+    "target_return_d1",
+    "target_return_d2",
+    "target_return_d3",
+    "target_return_d4",
+    "target_return_d5"
+  ],
+  "predicted_return_path": {
+    "d1": 0.0009042997339394044,
+    "d2": 0.0017937637862371306,
+    "d3": 0.00254685082869519,
+    "d4": 0.0032396203345200756,
+    "d5": 0.003926033594018954
+  },
+  "predicted_price_path": {
+    "d1": 109.558984648877,
+    "d2": 109.6563453840415,
+    "d3": 109.73877829170897,
+    "d4": 109.81460884181655,
+    "d5": 109.8897436372013
+  }
+}
