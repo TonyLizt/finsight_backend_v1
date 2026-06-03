@@ -97,6 +97,51 @@ def _recommendation_level(score: float) -> str:
     return "low"
 
 
+
+def _clean_request_params(params: dict | None) -> dict:
+    """清理保存和返回给前端的请求参数。
+
+    request_params 只应该保存用户原始请求参数，不应重复嵌入运行时状态。
+    运行时状态统一放在顶层 data_refresh_status，以及 explanation_json.data_refresh_status。
+    """
+    if not isinstance(params, dict):
+        return {}
+
+    cleaned = dict(params)
+    cleaned.pop("data_refresh_status", None)
+    return cleaned
+
+
+def _normalize_news_summary(summary: dict | None) -> dict | None:
+    """补全新闻情绪摘要的起止时间。
+
+    当前 sentiment_daily 聚合通常能给出 sentiment_curve，但部分路径下
+    news_start_time / news_end_time 为空。前端展示时需要明确窗口范围，因此：
+    - 如果 news_start_time 为空，则使用 sentiment_curve 第一项的 date；
+    - 如果 news_end_time 为空，则使用 sentiment_curve 最后一项的 date。
+    """
+    if not isinstance(summary, dict):
+        return summary
+
+    normalized = dict(summary)
+    curve = normalized.get("sentiment_curve")
+
+    if isinstance(curve, list) and curve:
+        dates = [
+            str(item.get("date"))
+            for item in curve
+            if isinstance(item, dict) and item.get("date")
+        ]
+
+        if dates:
+            if not normalized.get("news_start_time"):
+                normalized["news_start_time"] = dates[0]
+            if not normalized.get("news_end_time"):
+                normalized["news_end_time"] = dates[-1]
+
+    return normalized
+
+
 def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict:
     """运行真实模型预测。
 
@@ -279,6 +324,13 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         "结果仅用于课程实践和模拟分析，不构成真实投资建议。"
     )
 
+    # 返回给前端和保存到数据库的 request_params 只保留用户原始请求，
+    # 不重复嵌入 data_refresh_status。
+    clean_request_params = _clean_request_params(req.model_dump(mode="json"))
+
+    # 保证 news_summary 中有可展示的窗口起止时间。
+    sentiment = _normalize_news_summary(sentiment)
+
     pred = Prediction(
         user_id=user_id,
         ticker=ticker,
@@ -288,7 +340,7 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         forecast_days=req.forecast_days,
         forecast_start_date=forecast_start,
         forecast_end_date=forecast_end,
-        request_params_json={**req.model_dump(mode="json"), "data_refresh_status": data_refresh_status},
+        request_params_json=clean_request_params,
         current_price=current_price,
         predicted_label=predicted_label,
         prob_up=prob_up,
@@ -370,7 +422,7 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
         "model_version": _model_version_name(db, pred.model_version_id),
         "reg_model_version": _model_version_name(db, pred.reg_model_version_id),
         "model_match_status": model_match_status or _infer_model_match_status(db, pred),
-        "request_params": pred.request_params_json,
+        "request_params": _clean_request_params(pred.request_params_json),
         "current_price": float(pred.current_price) if pred.current_price is not None else None,
         "classification": {
             "predicted_label": pred.predicted_label,
@@ -393,7 +445,7 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
         },
         "data_refresh_status": (pred.explanation_json or {}).get("data_refresh_status"),
         "base_trading_date_source": ((pred.explanation_json or {}).get("data_refresh_status") or {}).get("base_trading_date_source"),
-        "news_summary": pred.sentiment_summary_json,
+        "news_summary": _normalize_news_summary(pred.sentiment_summary_json),
         "news_llm_report": pred.news_llm_report,
         "explanations": (pred.explanation_json or {}).get("main_reasons", []),
         "llm_report": pred.report_text,
