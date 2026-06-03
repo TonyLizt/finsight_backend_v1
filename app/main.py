@@ -13,6 +13,7 @@ from app.core.exceptions import AppException, INTERNAL_ERROR
 from app.core.responses import fail
 from app.db.init_db import init_db
 from app.routers import auth, admin_users, watchlist, stocks, predictions, backtest, logs, models, crawler
+from app.services.daily_refresh_service import start_daily_refresh_scheduler
 
 app = FastAPI(title=settings.project_name, version="1.0.0")
 
@@ -30,6 +31,9 @@ app.add_middleware(
 def on_startup():
     # 第一版使用 create_all 快速初始化。正式项目建议改用 Alembic 迁移。
     init_db()
+    # 可选启动每日数据自动补全调度器。
+    # 通过 ENABLE_DAILY_AUTO_REFRESH=1 控制，默认不开启，避免开发环境意外频繁访问外部行情源。
+    start_daily_refresh_scheduler()
 
 
 @app.exception_handler(AppException)

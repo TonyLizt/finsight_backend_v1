@@ -8,6 +8,8 @@ from app.core.deps import get_current_user
 from app.core.responses import ok
 from app.db.session import get_db
 from app.models.all_models import User, TechnicalIndicator
+from app.services.indicator_service import rebuild_technical_indicators_for_ticker
+from app.services.market_data_service import ensure_price_data
 from app.services.stock_service import (
     normalize_ticker,
     get_stock_or_404,
@@ -65,11 +67,21 @@ def stock_detail(
     range: str = "3m",
     include_news: bool = True,
     include_indicators: bool = True,
+    auto_refresh: bool = False,
+    force_refresh: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     ticker = normalize_ticker(ticker)
     stock = get_stock_or_404(db, ticker)
+
+    refresh_status = None
+    if auto_refresh:
+        # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试补齐最新可用日频行情。
+        # 这不是毫秒级实时行情，而是最新可用日频数据。
+        refresh_status = ensure_price_data(db, ticker, force_refresh=force_refresh)
+        rebuild_technical_indicators_for_ticker(db, ticker)
+
     latest = latest_price(db, ticker)
     days_map = {"1m": 22, "3m": 66, "6m": 132, "1y": 252}
     days = days_map.get(range, 66)
@@ -128,6 +140,10 @@ def stock_detail(
             "fifty_two_week_low": low52,
             "volume": latest.volume,
             "trading_date": latest.trading_date.isoformat(),
+            "quote_source": "yahoo_chart" if auto_refresh and refresh_status else "mysql_price_data",
+            "quote_fetched_at": datetime.now().isoformat() if auto_refresh and refresh_status else None,
+            "is_realtime": False,
+            "data_frequency": "daily",
         }
 
     return ok(
@@ -139,6 +155,7 @@ def stock_detail(
             "is_supported": stock.is_supported and data_status == "ready",
             "raw_is_supported": stock.is_supported,
             "data_status": data_status,
+            "data_refresh_status": refresh_status,
             "current_quote": current_quote,
             "price_curve": [
                 {
@@ -245,5 +262,5 @@ def sentiment_summary(
 ):
     ticker = normalize_ticker(ticker)
     get_stock_or_404(db, ticker)
-    # 第一版直接返回最近缓存聚合；后续可按 start/end/window 重算。
-    return ok({"ticker": ticker, **latest_sentiment_summary(db, ticker)})
+    end_date = end_time.date() if end_time else None
+    return ok({"ticker": ticker, **latest_sentiment_summary(db, ticker, end_date=end_date, window_days=window_days)})

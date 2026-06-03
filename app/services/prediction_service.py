@@ -6,7 +6,7 @@
 - LLM 报告当前使用模板生成，后续可替换为真实大模型调用。
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from math import exp
 from sqlalchemy.orm import Session
 
@@ -14,8 +14,9 @@ from app.core.exceptions import AppException, DATA_NOT_FOUND, PREDICTION_NOT_FOU
 from app.models.all_models import Prediction, ModelVersion, Stock, PriceData
 from app.schemas.prediction import PredictionRunRequest
 from app.services.stock_service import get_stock_or_404, latest_price, price_curve, latest_sentiment_summary, normalize_ticker
-from app.services.model_service import load_active_model, predict_classifier, predict_regressor
+from app.services.model_service import load_active_model, predict_aux_classifier, predict_classifier, predict_regressor
 from app.services.feature_service import build_feature_dict, validate_feature_columns
+from app.services.prediction_input_service import ensure_prediction_inputs
 
 
 def _sigmoid(x: float) -> float:
@@ -31,6 +32,25 @@ def _next_trading_days(base: date, n: int) -> list[date]:
         if current.weekday() < 5:
             days.append(current)
     return days
+
+
+def _parse_date(value) -> date | None:
+    """把 ensure_prediction_inputs 返回的日期统一转换为 date。
+
+    daily refresh / prediction input service 为了方便 JSON 返回，通常会把日期转成
+    "YYYY-MM-DD" 字符串；而 build_feature_dict 需要 date 或 None。这里统一处理，
+    避免用户指定 base_trading_date 后因为类型不一致而误判 DATA_NOT_FOUND。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _active_model(db: Session, model_type: str, forecast_days: int) -> ModelVersion | None:
@@ -98,7 +118,44 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
     if not stock.is_supported:
         raise AppException(STOCK_NOT_SUPPORTED, "该股票存在于基础库，但当前系统暂不支持分析。", 400)
 
-    # 保留原有行情检查，确保股票确实有可用于预测的行情。
+    # 预测前自动补全输入数据：
+    # 1. 如行情缺失或过旧，自动尝试拉取最新可用日频行情；
+    # 2. 重算 technical_indicators；
+    # 3. 基于最新行情/指标/情绪生成 runtime model_feature_snapshots；
+    # 4. 后续 build_feature_dict 将优先读取最新快照。
+    data_refresh_status = ensure_prediction_inputs(
+        db=db,
+        ticker=ticker,
+        forecast_days=req.forecast_days,
+        news_window_days=req.news_window_days,
+        force_refresh=req.force_refresh,
+        base_trading_date=req.base_trading_date,
+    )
+
+    # 如果预测输入准备失败，不继续调用模型。
+    # 典型失败场景：
+    # 1. 外部行情抓取失败，且缓存行情缺失或存在疑似异常；
+    # 2. 用户指定的 base_trading_date 之前没有可用行情；
+    # 3. runtime feature snapshot 无法生成。
+    if not data_refresh_status.get("can_continue", False):
+        raise AppException(
+            DATA_NOT_FOUND,
+            data_refresh_status.get("message") or f"未找到 {ticker} 的可用行情/特征数据。",
+            404,
+        )
+
+    actual_base_date = _parse_date(data_refresh_status.get("actual_base_trading_date"))
+
+    # 如果用户指定了 base_trading_date，必须使用该日期或该日期之前最近一个可用交易日。
+    # 不能静默退回全库最新日期，否则前端会误以为真的按指定日期预测。
+    if req.base_trading_date and actual_base_date is None:
+        raise AppException(
+            DATA_NOT_FOUND,
+            f"未找到 {ticker} 在 {req.base_trading_date} 或之前的可用行情/特征数据。",
+            404,
+        )
+
+    # 如果没有指定日期，但自动补全也没有给出实际基准日，则让 feature_service 走最新快照。
     latest = latest_price(db, ticker)
     if not latest or latest.close is None:
         raise AppException(DATA_NOT_FOUND, "未能获取该股票足够历史行情数据。", 404)
@@ -111,7 +168,9 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         raise AppException(DATA_NOT_FOUND, "分类模型与回归模型的特征列不一致，无法执行预测。", 500)
 
     # 构造与训练时完全一致的特征。
-    feature_result = build_feature_dict(db, ticker)
+    # 关键：这里必须使用 ensure_prediction_inputs 返回的 actual_base_trading_date。
+    # 它可能等于用户指定日期，也可能是该日期之前最近一个有行情的交易日。
+    feature_result = build_feature_dict(db, ticker, base_trading_date=actual_base_date)
     feature_dict = feature_result["feature_dict"]
     validate_feature_columns(feature_dict, classifier_model.feature_columns)
 
@@ -128,6 +187,19 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
     prob_up = classification["prob_up"]
     prob_neutral = classification["prob_neutral"]
     prob_down = classification["prob_down"]
+
+    # 辅助强信号模型。B 同学 v1.2 的 aux_classifier 使用 RidgeClassifier，
+    # 没有 predict_proba，model_service 中用 decision_function + sigmoid 生成 strong_signal_score。
+    aux_signal = None
+    strong_signal_score = None
+    try:
+        aux_model, _aux_match_status = load_active_model(db, "aux_classifier", 10)
+        aux_signal = predict_aux_classifier(aux_model, feature_dict)
+        strong_signal_score = aux_signal.get("strong_signal_score")
+    except Exception:
+        # 辅助模型是增强项，失败时不应阻断主预测流程。
+        aux_signal = None
+        strong_signal_score = None
 
     # 真实回归模型输出收益率路径。
     predicted_returns = predict_regressor(reg_model, feature_dict)
@@ -158,7 +230,7 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
     max_upside = max(0.0, (max(predicted_prices) - current_price) / current_price)
     max_downside = max(0.0, (current_price - min(predicted_prices)) / current_price)
 
-    sentiment = latest_sentiment_summary(db, ticker)
+    sentiment = latest_sentiment_summary(db, ticker, end_date=base_date, window_days=req.news_window_days)
     sentiment_score = float(sentiment.get("sentiment_score") or 0.0)
 
     recommendation_score = (
@@ -169,6 +241,10 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         + sentiment_score * 10
         - volatility * 100
     )
+
+    # 辅助强信号模型参与推荐分数，但权重保持较小，避免覆盖主分类/回归信号。
+    if strong_signal_score is not None:
+        recommendation_score += (float(strong_signal_score) - 0.5) * 20
     recommendation_score = max(0, min(100, recommendation_score))
     recommendation_level = _recommendation_level(recommendation_score)
 
@@ -189,8 +265,12 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         f"分类模型预测方向为 {predicted_label}。",
         f"上涨概率为 {prob_up:.1%}，震荡概率为 {prob_neutral:.1%}，下跌概率为 {prob_down:.1%}。",
         f"回归模型预测未来 {req.forecast_days} 个交易日最大上行空间约为 {max_upside:.2%}，最大下行空间约为 {max_downside:.2%}。",
-        f"推荐购买分数为 {recommendation_score:.1f}，等级为 {recommendation_level}。",
     ]
+
+    if strong_signal_score is not None:
+        explanations.append(f"辅助强信号模型得分为 {strong_signal_score:.3f}，已小权重参与推荐分数。")
+
+    explanations.append(f"推荐购买分数为 {recommendation_score:.1f}，等级为 {recommendation_level}。")
 
     report_text = (
         f"综合来看，{ticker} 在未来 {req.forecast_days} 个交易日的模型预测方向为 {predicted_label}。"
@@ -208,7 +288,7 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         forecast_days=req.forecast_days,
         forecast_start_date=forecast_start,
         forecast_end_date=forecast_end,
-        request_params_json=req.model_dump(),
+        request_params_json={**req.model_dump(mode="json"), "data_refresh_status": data_refresh_status},
         current_price=current_price,
         predicted_label=predicted_label,
         prob_up=prob_up,
@@ -229,8 +309,11 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
         news_llm_report=news_llm_report,
         explanation_json={
             "main_reasons": explanations,
+            "aux_model": aux_signal,
+            "data_refresh_status": data_refresh_status,
             "risk_notes": [
-                "当前模型为 v1.0 基线模型；新闻情绪摘要已接入，但完整多股票新闻特征仍需在 v1.1 中重新训练。",
+                "当前使用 v1.2 模型：主分类模型为二分类适配三分类 API，回归模型输出未来 1~5 日收益率路径。",
+                "预测输入会优先使用自动补全后的 model_feature_snapshots；若外部行情源不可用，则使用数据库已有最新特征。",
                 "预测结果仅用于课程实践和模拟分析，不构成真实投资建议。",
             ],
         },
@@ -295,6 +378,7 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
             "prob_neutral": pred.prob_neutral,
             "prob_down": pred.prob_down,
             "predicted_growth_prob": pred.predicted_growth_prob,
+            "aux_model": (pred.explanation_json or {}).get("aux_model"),
         },
         "regression": {
             "current_price": float(pred.current_price) if pred.current_price is not None else None,
@@ -307,6 +391,8 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
             "recommendation_level": pred.recommendation_level,
             "meaning": "分数越高越推荐，满分 100",
         },
+        "data_refresh_status": (pred.explanation_json or {}).get("data_refresh_status"),
+        "base_trading_date_source": ((pred.explanation_json or {}).get("data_refresh_status") or {}).get("base_trading_date_source"),
         "news_summary": pred.sentiment_summary_json,
         "news_llm_report": pred.news_llm_report,
         "explanations": (pred.explanation_json or {}).get("main_reasons", []),

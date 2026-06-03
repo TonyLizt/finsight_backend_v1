@@ -1,6 +1,6 @@
 """股票、行情、新闻查询服务。"""
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 
@@ -122,8 +122,28 @@ def calc_52_week_high_low(db: Session, ticker: str) -> tuple[float | None, float
     return (max(highs) if highs else None, min(lows) if lows else None)
 
 
-def latest_sentiment_summary(db: Session, ticker: str) -> dict:
-    rows = db.query(SentimentDaily).filter(SentimentDaily.ticker == ticker).order_by(SentimentDaily.trading_date.desc()).limit(7).all()[::-1]
+def latest_sentiment_summary(
+    db: Session,
+    ticker: str,
+    end_date: date | None = None,
+    window_days: int = 7,
+) -> dict:
+    """返回指定窗口内的新闻情绪摘要。
+
+    默认行为保持向后兼容：如果不传 end_date，就取数据库中最近 window_days 条
+    sentiment_daily。
+
+    预测接口应传入 base_trading_date 作为 end_date，避免把预测日期之后的新闻
+    混入本次预测报告。
+    """
+    ticker = normalize_ticker(ticker)
+
+    q = db.query(SentimentDaily).filter(SentimentDaily.ticker == ticker)
+    if end_date is not None:
+        q = q.filter(SentimentDaily.trading_date <= end_date)
+
+    rows = q.order_by(SentimentDaily.trading_date.desc()).limit(max(1, window_days)).all()[::-1]
+
     if not rows:
         return {
             "news_start_time": None,
@@ -136,13 +156,15 @@ def latest_sentiment_summary(db: Session, ticker: str) -> dict:
             "total_news_count": 0,
             "sentiment_curve": [],
         }
+
     total = sum(r.news_count or 0 for r in rows)
     pos = sum(r.positive_news_count or 0 for r in rows)
     neg = sum(r.negative_news_count or 0 for r in rows)
     neu = sum(r.neutral_news_count or 0 for r in rows)
-    scores = [r.sentiment_score for r in rows if r.sentiment_score is not None]
-    avg = sum(scores) / len(scores) if scores else 0
+    scores = [float(r.sentiment_score) for r in rows if r.sentiment_score is not None]
+    avg = sum(scores) / len(scores) if scores else 0.0
     label = "positive" if avg > 0.1 else "negative" if avg < -0.1 else "neutral"
+
     return {
         "news_start_time": rows[0].news_start_time.isoformat() if rows[0].news_start_time else None,
         "news_end_time": rows[-1].news_end_time.isoformat() if rows[-1].news_end_time else None,

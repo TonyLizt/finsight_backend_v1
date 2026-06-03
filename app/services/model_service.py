@@ -367,6 +367,65 @@ def predict_classifier(loaded: LoadedModel, feature_dict: dict) -> dict:
     }
 
 
+
+def _sigmoid(value: float) -> float:
+    """数值稳定的 sigmoid，用于 RidgeClassifier decision_function 伪概率。"""
+    import math
+
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def predict_aux_classifier(loaded: LoadedModel, feature_dict: dict) -> dict:
+    """辅助强信号模型预测。
+
+    B 同学 v1.2 的 ``finsight_cls_action1p5_h10_v1.2`` 是 RidgeClassifier，
+    它没有 predict_proba，但提供 decision_function。这里按交付说明使用
+    ``decision_function + sigmoid`` 生成 pseudo-score。
+
+    返回：
+    - strong_signal_pred：模型原始类别预测；
+    - strong_signal_score：sigmoid(decision_function)，不是严格概率；
+    - model_output_type：decision_function_sigmoid。
+    """
+    x = make_feature_frame(feature_dict, loaded.feature_columns)
+
+    if not hasattr(loaded.model, "predict"):
+        raise RuntimeError(f"Aux classifier does not support predict: {loaded.version.version_name}")
+
+    pred = int(loaded.model.predict(x)[0])
+
+    if hasattr(loaded.model, "decision_function"):
+        raw_score = loaded.model.decision_function(x)
+        if hasattr(raw_score, "tolist"):
+            raw_score = raw_score.tolist()
+        if isinstance(raw_score, list):
+            decision_value = raw_score[0]
+            if isinstance(decision_value, list):
+                decision_value = decision_value[0]
+        else:
+            decision_value = raw_score
+        decision_value = float(decision_value)
+        strong_signal_score = _sigmoid(decision_value)
+    elif hasattr(loaded.model, "predict_proba"):
+        proba = loaded.model.predict_proba(x)[0]
+        strong_signal_score = float(proba[-1])
+        decision_value = None
+    else:
+        decision_value = None
+        strong_signal_score = float(pred)
+
+    return {
+        "strong_signal_pred": pred,
+        "strong_signal_score": strong_signal_score,
+        "decision_value": decision_value,
+        "model_output_type": "decision_function_sigmoid",
+        "model_version": loaded.version.version_name,
+    }
+
 def predict_regressor(loaded: LoadedModel, feature_dict: dict) -> list[float]:
     """执行回归模型预测，返回未来 1~forecast_days 的收益率路径。
 
