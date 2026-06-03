@@ -24,6 +24,7 @@ from app.services.stock_service import (
     stock_data_status,
 )
 
+from app.services.news_detail_fetch_service import enrich_news_detail_if_needed
 router = APIRouter(prefix="/api/stocks", tags=["Stock API"])
 
 
@@ -230,6 +231,8 @@ def stock_news(
 @router.get("/news/{news_id}")
 def news_detail(news_id: int, include_html: bool = False, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     n = get_news_or_404(db, news_id)
+    # v1.3：新闻详情页按需抓取原文。抓取失败不影响基础详情返回。
+    n = enrich_news_detail_if_needed(db, n, include_html=include_html)
     return ok(
         {
             "news_id": n.id,

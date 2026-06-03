@@ -381,6 +381,7 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
 def prediction_to_card(db: Session, pred: Prediction) -> dict:
     stock = db.query(Stock).filter(Stock.ticker == pred.ticker).first()
     path = (pred.predicted_prices_json or {}).get("path", [])
+    summary = _normalize_news_summary(pred.sentiment_summary_json or {}) or {}
     return {
         "prediction_id": pred.id,
         "ticker": pred.ticker,
@@ -400,8 +401,8 @@ def prediction_to_card(db: Session, pred: Prediction) -> dict:
         "max_predicted_upside_pct": pred.max_predicted_upside_pct,
         "max_predicted_downside_pct": pred.max_predicted_downside_pct,
         "predicted_mini_curve": [{"date": p.get("target_date"), "predicted_price": p.get("predicted_price")} for p in path],
-        "news_start_time": (pred.sentiment_summary_json or {}).get("news_start_time"),
-        "news_end_time": (pred.sentiment_summary_json or {}).get("news_end_time"),
+        "news_start_time": summary.get("news_start_time"),
+        "news_end_time": summary.get("news_end_time"),
         "model_version": _model_version_name(db, pred.model_version_id),
     }
 
@@ -450,8 +451,8 @@ def prediction_to_detail(db: Session, pred: Prediction, model_match_status: str 
         "explanations": (pred.explanation_json or {}).get("main_reasons", []),
         "llm_report": pred.report_text,
     }
-    if saved is not None:
-        data["saved"] = saved
+    # 详情接口读取的是已保存预测记录，因此 saved 默认返回 true。
+    data["saved"] = True if saved is None else bool(saved)
     return data
 
 
