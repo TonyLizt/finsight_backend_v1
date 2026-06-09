@@ -8,7 +8,7 @@ from app.core.deps import get_current_user
 from app.core.responses import ok
 from app.db.session import get_db
 from app.models.all_models import User, TechnicalIndicator
-from app.services.intraday_market_service import get_hourly_intraday_curve
+from app.services.intraday_market_service import get_intraday_curve
 from app.services.news_detail_fetch_service import enrich_news_detail_if_needed
 from app.services.indicator_service import rebuild_technical_indicators_for_ticker
 from app.services.market_data_service import ensure_price_data
@@ -68,6 +68,7 @@ def search(
 def stock_detail(
     ticker: str,
     range: str = "3m",
+    interval: str | None = None,
     include_news: bool = True,
     include_indicators: bool = True,
     auto_refresh: bool = False,
@@ -83,6 +84,7 @@ def stock_detail(
         # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试用 Twelve Data
         # 增量补齐最新可用日频行情；range=1d 会优先读 intraday_price_data，
         # 缺失时由 Twelve Data 1min 分时数据现场补入库。
+        # interval=1min 时返回分钟级曲线；默认返回 hourly 聚合以兼容旧前端。
         refresh_status = ensure_price_data(db, ticker, force_refresh=force_refresh)
         rebuild_technical_indicators_for_ticker(db, ticker)
 
@@ -104,24 +106,36 @@ def stock_detail(
     is_intraday_range = requested_range == "1d"
     intraday_status = None
 
+    def normalize_intraday_interval(value: str | None) -> str:
+        normalized = (value or "hourly").strip().lower().replace("_", "-")
+        if normalized in {"1min", "1-min", "1minute", "1-minute", "minute", "minutes", "min", "m1", "1m"}:
+            return "1min"
+        if normalized in {"hourly", "hour", "hours", "1h", "h1", "60min", "60-min"}:
+            return "hourly"
+        return "hourly"
+
+    intraday_interval = normalize_intraday_interval(interval)
+
     if is_intraday_range:
-        # 1d 图使用 intraday_price_data 中的 Twelve Data 1min 数据聚合成小时级；
+        # 1d 图默认使用 intraday_price_data 中的 Twelve Data 1min 数据聚合成小时级；
+        # 传 interval=1min 时直接返回原始分钟级曲线。
         # 数据库缺失时可现场调用 Twelve Data 补入库。
-        intraday_result = get_hourly_intraday_curve(ticker, target_date=None)
+        intraday_result = get_intraday_curve(ticker, target_date=None, interval=intraday_interval)
         price_curve_items = intraday_result.get("items", [])
+        data_frequency = intraday_result.get("data_frequency") or intraday_interval
         intraday_status = {
             "status": intraday_result.get("status"),
             "source": intraday_result.get("source"),
             "ak_symbol": intraday_result.get("ak_symbol"),
             "target_date": intraday_result.get("target_date"),
             "actual_date": intraday_result.get("actual_date"),
+            "interval": data_frequency,
             "minute_count": intraday_result.get("minute_count"),
             "message": intraday_result.get("message"),
             "error": intraday_result.get("error"),
             "ingest_result": intraday_result.get("ingest_result"),
         }
         days = 1
-        data_frequency = "hourly"
     else:
         days = None if requested_range == "all" else daily_days_map.get(requested_range, 66)
         curve = price_curve(db, ticker, days)
@@ -232,6 +246,7 @@ def stock_detail(
             "data_refresh_status": refresh_status,
             "price_range": requested_range,
             "data_frequency": data_frequency,
+            "intraday_interval": data_frequency if is_intraday_range else None,
             "price_curve_count": len(price_curve_items),
             "price_curve_start": curve_start,
             "price_curve_end": curve_end,
