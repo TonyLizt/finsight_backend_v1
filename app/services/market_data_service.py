@@ -470,32 +470,39 @@ def fetch_yahoo_chart_prices(
     end_date: date,
     timeout_seconds: int | None = None,
 ) -> list[dict[str, Any]]:
-    """从 Yahoo Chart 拉取日频行情，作为 Alpha Vantage 的兜底源。"""
-    timeout_seconds = timeout_seconds or _env_int("MARKET_DATA_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+    """从 Yahoo Chart 拉取日频行情。
 
-    start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
-    # period2 不含当天，所以加一天。
-    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    本实现按 B 同学的 download_backtest_market_yahoo_chart.py 对齐：
+    - URL: https://query1.finance.yahoo.com/v8/finance/chart/{ticker}
+    - interval=1d
+    - events=history
+    - includeAdjustedClose=true
+    - headers 使用简洁 User-Agent / Accept
+    - 输出字段等价于 CSV: Date, Open, High, Low, Close, Adj Close, Volume
 
-    params = {
-        "period1": int(start_dt.timestamp()),
-        "period2": int(end_dt.timestamp()),
-        "interval": "1d",
-        "events": "history",
-        "includeAdjustedClose": "true",
-    }
+    注意：Yahoo 的 period2 是右开边界，所以这里使用 end_date + 1 day。
+    """
+    timeout_seconds = timeout_seconds or _env_int("MARKET_DATA_TIMEOUT_SECONDS", 60)
+
+    period1 = int(
+        datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc).timestamp()
+    )
+    period2 = int(
+        datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc).timestamp()
+    )
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
+        f"?period1={period1}&period2={period2}"
+        f"&interval=1d&events=history&includeAdjustedClose=true"
+    )
 
     headers = {
-        "User-Agent": os.getenv(
-            "MARKET_DATA_USER_AGENT",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-        ),
+        "User-Agent": os.getenv("MARKET_DATA_USER_AGENT", "Mozilla/5.0"),
         "Accept": "application/json,text/plain,*/*",
     }
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.upper()}"
-    response = requests.get(url, params=params, headers=headers, timeout=timeout_seconds)
+    response = requests.get(url, headers=headers, timeout=timeout_seconds)
     response.raise_for_status()
 
     payload = response.json()
@@ -505,36 +512,51 @@ def fetch_yahoo_chart_prices(
 
     results = chart.get("result") or []
     if not results:
-        return []
+        raise RuntimeError(f"No chart result for {ticker}: {payload}")
 
     result = results[0]
     timestamps = result.get("timestamp") or []
-    quote_list = (result.get("indicators") or {}).get("quote") or []
-    adj_list = (result.get("indicators") or {}).get("adjclose") or []
+    indicators = result.get("indicators") or {}
+    quote = (indicators.get("quote") or [{}])[0]
+    adjclose_block = (indicators.get("adjclose") or [{}])[0]
 
-    if not quote_list:
-        return []
-
-    quote = quote_list[0]
-    adjclose = adj_list[0].get("adjclose") if adj_list else []
+    open_list = quote.get("open") or []
+    high_list = quote.get("high") or []
+    low_list = quote.get("low") or []
+    close_list = quote.get("close") or []
+    volume_list = quote.get("volume") or []
+    adjclose_list = adjclose_block.get("adjclose") or []
 
     records: list[dict[str, Any]] = []
 
     for idx, ts in enumerate(timestamps):
+        close = close_list[idx] if idx < len(close_list) else None
+        if close is None:
+            continue
+
         trading_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        if trading_date < start_date or trading_date > end_date:
+            continue
+
         raw = {
             "trading_date": trading_date,
-            "open": (quote.get("open") or [None])[idx],
-            "high": (quote.get("high") or [None])[idx],
-            "low": (quote.get("low") or [None])[idx],
-            "close": (quote.get("close") or [None])[idx],
-            "adj_close": adjclose[idx] if idx < len(adjclose) else None,
-            "volume": (quote.get("volume") or [None])[idx],
+            "open": open_list[idx] if idx < len(open_list) else None,
+            "high": high_list[idx] if idx < len(high_list) else None,
+            "low": low_list[idx] if idx < len(low_list) else None,
+            "close": close,
+            "adj_close": adjclose_list[idx] if idx < len(adjclose_list) else close,
+            "volume": volume_list[idx] if idx < len(volume_list) else None,
         }
 
         record = _normalize_price_record(ticker, raw, source="yahoo_chart")
         if record is not None:
             records.append(record)
+
+    if not records:
+        raise RuntimeError(
+            f"Yahoo chart returned no valid OHLCV rows in requested range "
+            f"{start_date}~{end_date}"
+        )
 
     return _add_previous_close(records)
 
@@ -670,33 +692,32 @@ def fetch_online_price_records(
     start_date: date,
     end_date: date,
 ) -> tuple[list[dict[str, Any]], str, list[str]]:
-    """按配置自爬线上行情。
+    """按配置抓取行情：Yahoo Chart 优先，不再使用 Alpha Vantage 行情接口。
 
-    默认优先级：
-    1. Alpha Vantage；
-    2. Yahoo Chart；
-    3. 可选本地 CSV fallback，默认关闭。
+    v1.3 Yahoo market 策略：
+    1. 默认只尝试 Yahoo Chart；
+    2. 可选 local_raw_csv fallback；
+    3. 即使 MARKET_DATA_SOURCE_PRIORITY 中仍写 alpha_vantage，也会自动忽略；
+    4. 新闻抓取不受影响，Alpha Vantage News Sentiment 仍可继续用于 news_data。
     """
+    raw_priority = os.getenv("MARKET_DATA_SOURCE_PRIORITY", "yahoo_chart,local_raw_csv")
+    source_priority = [item.strip().lower() for item in raw_priority.split(",") if item.strip()]
+
+    # 行情链路不再调用 Alpha Vantage，避免 premium endpoint / free rate limit。
     source_priority = [
-        item.strip().lower()
-        for item in os.getenv(
-            "MARKET_DATA_SOURCE_PRIORITY",
-            "alpha_vantage,yahoo_chart",
-        ).split(",")
-        if item.strip()
+        item
+        for item in source_priority
+        if item not in {"alpha_vantage", "alphavantage", "av"}
     ]
+
+    if not source_priority:
+        source_priority = ["yahoo_chart", "local_raw_csv"]
 
     errors: list[str] = []
 
     for source in source_priority:
         try:
-            if source in {"alpha_vantage", "alphavantage", "av"}:
-                records = fetch_alpha_vantage_daily_prices(ticker, start_date, end_date)
-                if records:
-                    return records, "alpha_vantage", errors
-                errors.append("alpha_vantage returned no records")
-
-            elif source in {"yahoo", "yahoo_chart"}:
+            if source in {"yahoo", "yahoo_chart"}:
                 if not _env_bool("ENABLE_YAHOO_CHART_FALLBACK", True):
                     errors.append("yahoo_chart disabled by ENABLE_YAHOO_CHART_FALLBACK=0")
                     continue
@@ -717,7 +738,7 @@ def fetch_online_price_records(
                 errors.append("local_raw_csv returned no records")
 
             else:
-                errors.append(f"unknown market data source: {source}")
+                errors.append(f"unknown or disabled market data source: {source}")
 
         except Exception as exc:
             errors.append(f"{source} failed: {exc}")
@@ -738,7 +759,7 @@ def ensure_price_data(
     线上自爬规则：
     1. 非强制刷新时，如果缓存新鲜且质量正常，直接返回 cached；
     2. 需要刷新时，按 MARKET_DATA_SOURCE_PRIORITY 自行爬取；
-    3. 默认优先 Alpha Vantage，再 Yahoo，不依赖 B 同学本地 CSV；
+    3. 默认使用与 B 同学脚本一致的 Yahoo Chart，不依赖 B 同学本地 CSV；
     4. 抓取失败且 force_refresh=True 时，返回 failed，不继续预测；
     5. 抓取失败但缓存质量正常且 force_refresh=False 时，允许使用缓存；
     6. 发现异常价格时返回 failed，阻止生成新 feature snapshot。

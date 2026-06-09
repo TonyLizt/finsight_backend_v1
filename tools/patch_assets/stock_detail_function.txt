@@ -1,0 +1,189 @@
+@router.get("/{ticker}/detail")
+def stock_detail(
+    ticker: str,
+    range: str = "3m",
+    include_news: bool = True,
+    include_indicators: bool = True,
+    auto_refresh: bool = False,
+    force_refresh: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    ticker = normalize_ticker(ticker)
+    stock = get_stock_or_404(db, ticker)
+
+    refresh_status = None
+    if auto_refresh:
+        # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试补齐最新可用日频行情。
+        # 注意：auto_refresh 只刷新日频 price_data；range=1d 的小时级曲线由 AKShare 分时服务单独获取。
+        refresh_status = ensure_price_data(db, ticker, force_refresh=force_refresh)
+        rebuild_technical_indicators_for_ticker(db, ticker)
+
+    latest = latest_price(db, ticker)
+
+    requested_range = (range or "3m").strip().lower()
+    valid_ranges = {"1d", "5d", "1m", "3m", "6m", "1y", "all"}
+    if requested_range not in valid_ranges:
+        requested_range = "3m"
+
+    daily_days_map = {
+        "5d": 5,
+        "1m": 22,
+        "3m": 66,
+        "6m": 132,
+        "1y": 252,
+    }
+
+    is_intraday_range = requested_range == "1d"
+    intraday_status = None
+
+    if is_intraday_range:
+        # 1d 图使用 AKShare 美股分钟数据聚合成小时级；不使用单条日频 K 线代替。
+        # 不传 target_date，默认取 AKShare 返回的最新一个美股交易日。
+        intraday_result = get_hourly_intraday_curve(ticker, target_date=None)
+        price_curve_items = intraday_result.get("items", [])
+        intraday_status = {
+            "status": intraday_result.get("status"),
+            "source": intraday_result.get("source"),
+            "ak_symbol": intraday_result.get("ak_symbol"),
+            "target_date": intraday_result.get("target_date"),
+            "actual_date": intraday_result.get("actual_date"),
+            "message": intraday_result.get("message"),
+            "error": intraday_result.get("error"),
+        }
+        days = 1
+        data_frequency = "hourly"
+    else:
+        days = None if requested_range == "all" else daily_days_map.get(requested_range, 66)
+        curve = price_curve(db, ticker, days)
+        price_curve_items = [
+            {
+                "date": p.trading_date.isoformat(),
+                "open": float(p.open) if p.open is not None else None,
+                "high": float(p.high) if p.high is not None else None,
+                "low": float(p.low) if p.low is not None else None,
+                "close": float(p.close) if p.close is not None else None,
+                "daily_return": p.daily_return,
+                "amplitude": p.amplitude,
+                "volume": p.volume,
+                "data_frequency": "daily",
+                "source": "mysql_price_data",
+            }
+            for p in curve
+        ]
+        data_frequency = "daily"
+
+    high52, low52 = calc_52_week_high_low(db, ticker)
+
+    latest_news = []
+    if include_news:
+        latest_news = news_query(db, ticker).limit(10).all()
+
+    indicator_curve = []
+    if include_indicators:
+        indicator_q = (
+            db.query(TechnicalIndicator)
+            .filter(TechnicalIndicator.ticker == ticker)
+            .order_by(TechnicalIndicator.trading_date.desc())
+        )
+        # range=all 时技术指标也返回全部；range=1d 时只返回最新一条日频技术指标。
+        if days is not None:
+            indicator_q = indicator_q.limit(days)
+        indicators = indicator_q.all()[::-1]
+        indicator_curve = [
+            {
+                "date": i.trading_date.isoformat(),
+                "ma5": i.ma5,
+                "ma20": i.ma20,
+                "ma60": i.ma60,
+                "rsi": i.rsi,
+                "macd": i.macd,
+            }
+            for i in indicators
+        ]
+
+    data_status = stock_data_status(db, stock)
+    current_quote = {
+        "current_price": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "previous_close": None,
+        "change": None,
+        "change_percent": None,
+        "daily_return": None,
+        "amplitude": None,
+        "fifty_two_week_high": high52,
+        "fifty_two_week_low": low52,
+        "volume": None,
+        "trading_date": None,
+    }
+    if latest:
+        current_quote = {
+            "current_price": float(latest.close) if latest.close is not None else None,
+            "open": float(latest.open) if latest.open is not None else None,
+            "high": float(latest.high) if latest.high is not None else None,
+            "low": float(latest.low) if latest.low is not None else None,
+            "close": float(latest.close) if latest.close is not None else None,
+            "previous_close": float(latest.previous_close) if latest.previous_close is not None else None,
+            "change": float(latest.change_amount) if latest.change_amount is not None else None,
+            "change_percent": display_change_percent(latest.change_percent),
+            "daily_return": latest.daily_return,
+            "amplitude": latest.amplitude,
+            "fifty_two_week_high": high52,
+            "fifty_two_week_low": low52,
+            "volume": latest.volume,
+            "trading_date": latest.trading_date.isoformat(),
+            "quote_source": "mysql_price_data",
+            "quote_fetched_at": datetime.now().isoformat() if auto_refresh and refresh_status else None,
+            "is_realtime": False,
+            "data_frequency": "daily",
+        }
+
+    curve_start = None
+    curve_end = None
+    if price_curve_items:
+        if is_intraday_range:
+            curve_start = price_curve_items[0].get("timestamp")
+            curve_end = price_curve_items[-1].get("timestamp")
+        else:
+            curve_start = price_curve_items[0].get("date")
+            curve_end = price_curve_items[-1].get("date")
+
+    return ok(
+        {
+            "ticker": stock.ticker,
+            "company_name": stock.company_name,
+            "market": stock.market,
+            "sector": None,
+            "is_supported": stock.is_supported and data_status == "ready",
+            "raw_is_supported": stock.is_supported,
+            "data_status": data_status,
+            "data_refresh_status": refresh_status,
+            "price_range": requested_range,
+            "data_frequency": data_frequency,
+            "price_curve_count": len(price_curve_items),
+            "price_curve_start": curve_start,
+            "price_curve_end": curve_end,
+            "intraday_status": intraday_status,
+            "current_quote": current_quote,
+            "price_curve": price_curve_items,
+            "indicator_curve": indicator_curve,
+            "latest_news": [
+                {
+                    "news_id": n.id,
+                    "title": n.title,
+                    "summary": n.summary,
+                    "source": n.source,
+                    "publish_time": n.publish_time.isoformat() if n.publish_time else None,
+                    "sentiment_score": n.sentiment_score if n.sentiment_score is not None else 0.0,
+                    "sentiment_label": n.sentiment_label or "neutral",
+                }
+                for n in latest_news
+            ],
+            "sentiment_summary": latest_sentiment_summary(db, ticker),
+        }
+    )
+
+

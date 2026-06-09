@@ -1,6 +1,6 @@
 """股票、行情、新闻查询服务。"""
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 
@@ -111,8 +111,21 @@ def latest_price(db: Session, ticker: str) -> PriceData | None:
     return db.query(PriceData).filter(PriceData.ticker == ticker).order_by(PriceData.trading_date.desc()).first()
 
 
-def price_curve(db: Session, ticker: str, days: int = 90) -> list[PriceData]:
-    return db.query(PriceData).filter(PriceData.ticker == ticker).order_by(PriceData.trading_date.desc()).limit(days).all()[::-1]
+def price_curve(db: Session, ticker: str, days: int | None = 90) -> list[PriceData]:
+    """返回股票日频价格曲线。
+
+    days:
+        - int：返回最近 N 个交易日；
+        - None：返回该 ticker 在 price_data 表中的全部历史日频数据。
+    """
+    q = (
+        db.query(PriceData)
+        .filter(PriceData.ticker == normalize_ticker(ticker))
+        .order_by(PriceData.trading_date.desc())
+    )
+    if days is not None:
+        q = q.limit(max(1, int(days)))
+    return q.all()[::-1]
 
 
 def calc_52_week_high_low(db: Session, ticker: str) -> tuple[float | None, float | None]:
@@ -126,7 +139,7 @@ def latest_sentiment_summary(
     db: Session,
     ticker: str,
     end_date: date | None = None,
-    window_days: int = 7,
+    window_days: int = 14,
 ) -> dict:
     """返回指定窗口内的新闻情绪摘要。
 
@@ -148,6 +161,9 @@ def latest_sentiment_summary(
         return {
             "news_start_time": None,
             "news_end_time": None,
+            "sentiment_window_days": max(1, window_days),
+            "sentiment_start_date": None,
+            "sentiment_end_date": None,
             "sentiment_score": 0.0,
             "sentiment_label": "neutral",
             "positive_news_count": 0,
@@ -168,6 +184,9 @@ def latest_sentiment_summary(
     return {
         "news_start_time": rows[0].news_start_time.isoformat() if rows[0].news_start_time else None,
         "news_end_time": rows[-1].news_end_time.isoformat() if rows[-1].news_end_time else None,
+        "sentiment_window_days": max(1, window_days),
+        "sentiment_start_date": rows[0].trading_date.isoformat(),
+        "sentiment_end_date": rows[-1].trading_date.isoformat(),
         "sentiment_score": avg,
         "sentiment_label": label,
         "positive_news_count": pos,
@@ -184,6 +203,65 @@ def latest_sentiment_summary(
             }
             for r in rows
         ],
+    }
+
+
+def sentiment_counts_for_last_two_weeks(
+    db: Session,
+    ticker: str,
+    end_time: datetime | None = None,
+    window_days: int = 14,
+) -> dict:
+    """按最近 14 个自然日统计原始新闻正/负/中性数量。
+
+    统计口径：
+    - 直接基于 news_data.publish_time；
+    - 不基于 sentiment_daily，避免滚动聚合窗口造成重复累计；
+    - 默认截止日为该 ticker 最新新闻 publish_time 所在日期；
+    - 如果传入 end_time，则以 end_time 所在日期为截止日；
+    - 窗口为最近 window_days 个自然日，包含截止日。例如截止日 2026-06-08，
+      window_days=14 时，起始日期为 2026-05-26。
+    """
+    ticker = normalize_ticker(ticker)
+    window_days = max(1, int(window_days or 14))
+
+    if end_time is not None:
+        end_date = end_time.date()
+    else:
+        latest_publish_time = (
+            db.query(func.max(NewsData.publish_time))
+            .filter(NewsData.ticker == ticker)
+            .scalar()
+        )
+        end_date = latest_publish_time.date() if latest_publish_time else datetime.now().date()
+
+    start_date = end_date - timedelta(days=window_days - 1)
+    start_dt = datetime.combine(start_date, time.min)
+    end_dt = datetime.combine(end_date, time.max)
+
+    base_q = db.query(NewsData).filter(
+        NewsData.ticker == ticker,
+        NewsData.publish_time.isnot(None),
+        NewsData.publish_time >= start_dt,
+        NewsData.publish_time <= end_dt,
+    )
+
+    total = base_q.count()
+    positive = base_q.filter(NewsData.sentiment_label == "positive").count()
+    negative = base_q.filter(NewsData.sentiment_label == "negative").count()
+    neutral = max(total - positive - negative, 0)
+
+    return {
+        "window_days": window_days,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "news_start_time": start_dt.isoformat(),
+        "news_end_time": end_dt.isoformat(),
+        "count_source": "news_data",
+        "positive_news_count": positive,
+        "negative_news_count": negative,
+        "neutral_news_count": neutral,
+        "total_news_count": total,
     }
 
 

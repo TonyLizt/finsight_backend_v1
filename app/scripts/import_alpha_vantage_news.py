@@ -140,7 +140,7 @@ def import_file(db: Session, ticker: str, path: Path) -> dict:
             existing.assigned_trading_date = assigned_date
             existing.title = title
             existing.summary = item.get("summary")
-            existing.content_text = item.get("summary")
+            existing.content_text = None
             existing.source = item.get("source") or item.get("source_domain")
             existing.sentiment_score = sentiment_score
             existing.sentiment_label = sentiment_label
@@ -153,7 +153,7 @@ def import_file(db: Session, ticker: str, path: Path) -> dict:
                 assigned_trading_date=assigned_date,
                 title=title,
                 summary=item.get("summary"),
-                content_text=item.get("summary"),
+                content_text=None,
                 content_html=None,
                 source=item.get("source") or item.get("source_domain"),
                 url=url,

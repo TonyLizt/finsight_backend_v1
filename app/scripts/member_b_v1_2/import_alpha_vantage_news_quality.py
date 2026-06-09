@@ -163,7 +163,7 @@ def import_file(db: Session, ticker: str, path: Path, min_relevance: float) -> d
             existing.assigned_trading_date = assigned_date
             existing.title = title
             existing.summary = summary
-            existing.content_text = summary
+            existing.content_text = None
             existing.content_html = None
             existing.source = item.get("source") or item.get("source_domain")
             existing.sentiment_score = sentiment_score
@@ -177,7 +177,7 @@ def import_file(db: Session, ticker: str, path: Path, min_relevance: float) -> d
                 assigned_trading_date=assigned_date,
                 title=title,
                 summary=summary,
-                content_text=summary,
+                content_text=None,
                 content_html=None,
                 source=item.get("source") or item.get("source_domain"),
                 url=url,

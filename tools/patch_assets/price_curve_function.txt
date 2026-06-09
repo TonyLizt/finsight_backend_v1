@@ -1,0 +1,17 @@
+def price_curve(db: Session, ticker: str, days: int | None = 90) -> list[PriceData]:
+    """返回股票日频价格曲线。
+
+    days:
+        - int：返回最近 N 个交易日；
+        - None：返回该 ticker 在 price_data 表中的全部历史日频数据。
+    """
+    q = (
+        db.query(PriceData)
+        .filter(PriceData.ticker == normalize_ticker(ticker))
+        .order_by(PriceData.trading_date.desc())
+    )
+    if days is not None:
+        q = q.limit(max(1, int(days)))
+    return q.all()[::-1]
+
+

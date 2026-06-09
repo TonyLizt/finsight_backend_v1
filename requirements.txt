@@ -18,3 +18,4 @@ scikit-learn==1.8.0
 joblib
 xgboost
 pyarrow
+akshare>=1.18.0
