@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 1440
 
+    # 阿里云百炼 / DashScope 应用 API 配置。
+    # 默认关闭；未配置或调用失败时，预测接口会自动降级为本地模板文本，
+    # 不影响现有股票预测、历史记录、详情接口的正常返回。
+    dashscope_api_key: str | None = None
+    bailian_enable: bool = False
+    bailian_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
+    bailian_news_app_id: str | None = None
+    bailian_report_app_id: str | None = None
+    bailian_workspace_id: str | None = None
+    bailian_timeout_seconds: int = 45
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

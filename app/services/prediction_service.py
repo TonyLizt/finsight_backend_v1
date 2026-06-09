@@ -11,12 +11,13 @@ from math import exp
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import AppException, DATA_NOT_FOUND, PREDICTION_NOT_FOUND, STOCK_NOT_SUPPORTED
-from app.models.all_models import Prediction, ModelVersion, Stock, PriceData
+from app.models.all_models import Prediction, ModelVersion, Stock, PriceData, NewsData
 from app.schemas.prediction import PredictionRunRequest
 from app.services.stock_service import get_stock_or_404, latest_price, price_curve, latest_sentiment_summary, normalize_ticker
 from app.services.model_service import load_active_model, predict_aux_classifier, predict_classifier, predict_regressor
 from app.services.feature_service import build_feature_dict, validate_feature_columns
 from app.services.prediction_input_service import ensure_prediction_inputs
+from app.services.llm_service import generate_news_llm_report, generate_overall_llm_report
 
 
 def _sigmoid(x: float) -> float:
@@ -300,11 +301,42 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
     else:
         model_match_status = classifier_match_status
 
-    news_llm_report = (
-        "当前版本已接入新闻情绪摘要，但尚未接入成员 C 的真实新闻 LLM 深度分析。"
-        f"近窗口新闻情绪分数为 {sentiment_score:.3f}，"
-        "该分数已参与推荐分数计算。"
+    # 保证 news_summary 中有可展示的窗口起止时间。
+    sentiment = _normalize_news_summary(sentiment)
+
+    latest_news_rows = (
+        db.query(NewsData)
+        .filter(NewsData.ticker == ticker)
+        .order_by(NewsData.publish_time.desc())
+        .limit(10)
+        .all()
     )
+    latest_news_for_llm = [
+        {
+            "news_id": item.id,
+            "title": item.title,
+            "summary": item.summary,
+            "source": item.source,
+            "publish_time": item.publish_time.isoformat() if item.publish_time else None,
+            "sentiment_score": item.sentiment_score,
+            "sentiment_label": item.sentiment_label,
+        }
+        for item in latest_news_rows
+    ]
+
+    news_llm_report = generate_news_llm_report(
+        ticker=ticker,
+        company_name=stock.company_name,
+        base_trading_date=base_date.isoformat() if base_date else None,
+        news_summary=sentiment,
+        latest_news=latest_news_for_llm,
+    )
+    if not news_llm_report:
+        news_llm_report = (
+            "当前版本已接入新闻情绪摘要，但百炼新闻 LLM 深度分析暂时不可用。"
+            f"近窗口新闻情绪分数为 {sentiment_score:.3f}，"
+            "该分数已参与推荐分数计算。"
+        )
 
     explanations = [
         f"分类模型预测方向为 {predicted_label}。",
@@ -317,19 +349,50 @@ def run_prediction(db: Session, user_id: int, req: PredictionRunRequest) -> dict
 
     explanations.append(f"推荐购买分数为 {recommendation_score:.1f}，等级为 {recommendation_level}。")
 
-    report_text = (
-        f"综合来看，{ticker} 在未来 {req.forecast_days} 个交易日的模型预测方向为 {predicted_label}。"
-        "本结果由当前激活的新闻增强版分类模型与回归模型生成。"
-        "当前已接入新闻情绪摘要并参与推荐分数计算，但新闻 LLM 深度分析仍为模板降级版本。"
-        "结果仅用于课程实践和模拟分析，不构成真实投资建议。"
+    classification_for_llm = {
+        "predicted_label": predicted_label,
+        "prob_up": prob_up,
+        "prob_neutral": prob_neutral,
+        "prob_down": prob_down,
+        "predicted_growth_prob": prob_up,
+        "aux_model": aux_signal,
+    }
+    regression_for_llm = {
+        "current_price": current_price,
+        "price_path": price_path,
+        "max_predicted_upside_pct": max_upside,
+        "max_predicted_downside_pct": max_downside,
+    }
+    recommendation_for_llm = {
+        "recommendation_score": recommendation_score,
+        "recommendation_level": recommendation_level,
+        "meaning": "分数越高越推荐，满分 100",
+    }
+
+    report_text = generate_overall_llm_report(
+        ticker=ticker,
+        company_name=stock.company_name,
+        base_trading_date=base_date.isoformat() if base_date else None,
+        forecast_days=req.forecast_days,
+        current_price=current_price,
+        classification=classification_for_llm,
+        regression=regression_for_llm,
+        recommendation=recommendation_for_llm,
+        news_summary=sentiment,
+        news_llm_report=news_llm_report,
+        explanations=explanations,
     )
+    if not report_text:
+        report_text = (
+            f"综合来看，{ticker} 在未来 {req.forecast_days} 个交易日的模型预测方向为 {predicted_label}。"
+            "本结果由当前激活的新闻增强版分类模型与回归模型生成。"
+            "当前已接入新闻情绪摘要并参与推荐分数计算，但百炼整体 LLM 报告暂时不可用。"
+            "结果仅用于课程实践和模拟分析，不构成真实投资建议。"
+        )
 
     # 返回给前端和保存到数据库的 request_params 只保留用户原始请求，
     # 不重复嵌入 data_refresh_status。
     clean_request_params = _clean_request_params(req.model_dump(mode="json"))
-
-    # 保证 news_summary 中有可展示的窗口起止时间。
-    sentiment = _normalize_news_summary(sentiment)
 
     pred = Prediction(
         user_id=user_id,
