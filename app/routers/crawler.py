@@ -130,6 +130,7 @@ def _run_daily_refresh_task(req: DailyDataRefreshRequest, task_log_id: int) -> N
             target_date=req.target_date,
             force_refresh=req.force_refresh,
             limit=req.limit,
+            modules=req.modules,
         )
 
         log = task_db.query(CrawlerLog).filter(CrawlerLog.id == task_log_id).first()
@@ -195,6 +196,7 @@ def trigger_daily_data_refresh(
             "force_refresh": req.force_refresh,
             "limit": req.limit,
             "tickers": req.tickers,
+            "modules": req.modules,
             "message": "daily data refresh started",
         },
         "ok",

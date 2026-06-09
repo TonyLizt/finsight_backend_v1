@@ -37,6 +37,8 @@ PRICE_FEATURE_FIELDS = [
     "low",
     "close",
     "volume",
+    "previous_close",
+    "change_amount",
     "daily_return",
     "change_percent",
     "amplitude",
@@ -82,6 +84,18 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(s)
     except (TypeError, ValueError):
         return default
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        if not s or s.lower() in {"nan", "none", "null"}:
+            return None
+        return float(s)
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_date(value: Any) -> date | None:
@@ -162,6 +176,83 @@ def _get_template_snapshot(db: Session, ticker: str, target_date: date | None = 
         "features": features,
     }
 
+
+
+def _get_previous_close(db: Session, ticker: str, trading_date: date) -> float | None:
+    """Return previous trading day's close for robust feature derivation."""
+    row = db.execute(
+        text(
+            """
+            SELECT close
+            FROM price_data
+            WHERE ticker = :ticker
+              AND trading_date < :trading_date
+              AND close IS NOT NULL
+            ORDER BY trading_date DESC
+            LIMIT 1
+            """
+        ),
+        {"ticker": ticker, "trading_date": trading_date},
+    ).mappings().first()
+    if not row:
+        return None
+    return _to_float_or_none(row.get("close"))
+
+
+def _build_price_features(
+    db: Session,
+    ticker: str,
+    base_date: date,
+    price_row: dict[str, Any],
+) -> dict[str, float]:
+    """Build price-derived features from price_data without silently filling zeros.
+
+    v1.5 hotfix:
+    - Do not use the template snapshot's stale price fields.
+    - Do not let missing DB values become 0.0 for daily_return/change/amplitude.
+    - If price_data derived columns are missing, compute them from OHLC and the
+      previous trading day's close.
+    """
+    open_price = _to_float_or_none(price_row.get("open"))
+    high = _to_float_or_none(price_row.get("high"))
+    low = _to_float_or_none(price_row.get("low"))
+    close = _to_float_or_none(price_row.get("close"))
+    volume = _to_float_or_none(price_row.get("volume"))
+
+    previous_close = _to_float_or_none(price_row.get("previous_close"))
+    if previous_close is None or previous_close <= 0:
+        previous_close = _get_previous_close(db, ticker, base_date)
+
+    change_amount = _to_float_or_none(price_row.get("change_amount"))
+    if change_amount is None and close is not None and previous_close not in (None, 0):
+        change_amount = close - previous_close
+
+    daily_return = _to_float_or_none(price_row.get("daily_return"))
+    if daily_return is None and change_amount is not None and previous_close not in (None, 0):
+        daily_return = change_amount / previous_close
+
+    change_percent = _to_float_or_none(price_row.get("change_percent"))
+    if change_percent is None and daily_return is not None:
+        # In feature snapshots we keep the model-side convention: fraction, same as daily_return.
+        change_percent = daily_return
+
+    amplitude = _to_float_or_none(price_row.get("amplitude"))
+    if amplitude is None and high is not None and low is not None and previous_close not in (None, 0):
+        amplitude = (high - low) / previous_close
+
+    values = {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "previous_close": previous_close,
+        "change_amount": change_amount,
+        "daily_return": daily_return,
+        "change_percent": change_percent,
+        "amplitude": amplitude,
+    }
+    return {k: float(v) for k, v in values.items() if v is not None}
 
 def _get_price_row(db: Session, ticker: str, target_date: date | None = None) -> dict[str, Any] | None:
     if target_date:
@@ -302,7 +393,7 @@ def _upsert_snapshot(
                 {
                     "source": RUNTIME_DATASET_VERSION,
                     "generated_at": date.today().isoformat(),
-                    "note": "generated from latest price_data, technical_indicators and carried-forward fund_* features",
+                    "note": "generated from latest price_data, technical_indicators, sentiment_daily and carried-forward fund_* features; price-derived fields are force-synced from price_data",
                 },
                 ensure_ascii=False,
             ),
@@ -400,9 +491,13 @@ def ensure_latest_feature_snapshot(
 
     features = dict(template["features"])
 
+    # v1.5 hotfix: always overwrite price-derived features from price_data.
+    # Do not restrict updates to keys already present in the template, because
+    # older templates may miss previous_close/change_amount or carry stale zeros.
+    price_features = _build_price_features(db, ticker, base_date, price_row)
     for field in PRICE_FEATURE_FIELDS:
-        if field in features and field in price_row:
-            features[field] = _to_float(price_row.get(field))
+        if field in price_features:
+            features[field] = price_features[field]
 
     for field in INDICATOR_FEATURE_FIELDS:
         if field in features and field in indicator_row:

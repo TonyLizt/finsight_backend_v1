@@ -18,6 +18,10 @@ class DailyDataRefreshRequest(BaseModel):
     """
 
     tickers: list[str] | None = None
+    modules: list[str] | None = Field(
+        default=None,
+        description="可选模块，例如 ['market','intraday','technical','news','news_fulltext','sentiment','features']",
+    )
     target_date: date | None = None
     force_refresh: bool = False
     limit: int = Field(default=50, ge=1, le=500)

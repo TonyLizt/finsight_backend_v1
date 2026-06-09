@@ -9,6 +9,7 @@ from app.core.responses import ok
 from app.db.session import get_db
 from app.models.all_models import User, TechnicalIndicator
 from app.services.intraday_market_service import get_hourly_intraday_curve
+from app.services.news_detail_fetch_service import enrich_news_detail_if_needed
 from app.services.indicator_service import rebuild_technical_indicators_for_ticker
 from app.services.market_data_service import ensure_price_data
 from app.services.stock_service import (
@@ -24,11 +25,6 @@ from app.services.stock_service import (
     display_change_percent,
     stock_data_status,
     sentiment_counts_for_last_two_weeks,
-)
-from app.services.news_detail_fetch_service import (
-    enrich_news_detail_if_needed,
-    get_original_content_text,
-    news_detail_source,
 )
 
 router = APIRouter(prefix="/api/stocks", tags=["Stock API"])
@@ -84,8 +80,9 @@ def stock_detail(
 
     refresh_status = None
     if auto_refresh:
-        # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试补齐最新可用日频行情。
-        # 注意：auto_refresh 只刷新日频 price_data；range=1d 的小时级曲线由 AKShare 分时服务单独获取。
+        # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试用 Twelve Data
+        # 增量补齐最新可用日频行情；range=1d 会优先读 intraday_price_data，
+        # 缺失时由 Twelve Data 1min 分时数据现场补入库。
         refresh_status = ensure_price_data(db, ticker, force_refresh=force_refresh)
         rebuild_technical_indicators_for_ticker(db, ticker)
 
@@ -108,8 +105,8 @@ def stock_detail(
     intraday_status = None
 
     if is_intraday_range:
-        # 1d 图使用 AKShare 美股分钟数据聚合成小时级；不使用单条日频 K 线代替。
-        # 不传 target_date，默认取 AKShare 返回的最新一个美股交易日。
+        # 1d 图使用 intraday_price_data 中的 Twelve Data 1min 数据聚合成小时级；
+        # 数据库缺失时可现场调用 Twelve Data 补入库。
         intraday_result = get_hourly_intraday_curve(ticker, target_date=None)
         price_curve_items = intraday_result.get("items", [])
         intraday_status = {
@@ -118,8 +115,10 @@ def stock_detail(
             "ak_symbol": intraday_result.get("ak_symbol"),
             "target_date": intraday_result.get("target_date"),
             "actual_date": intraday_result.get("actual_date"),
+            "minute_count": intraday_result.get("minute_count"),
             "message": intraday_result.get("message"),
             "error": intraday_result.get("error"),
+            "ingest_result": intraday_result.get("ingest_result"),
         }
         days = 1
         data_frequency = "hourly"
@@ -314,9 +313,7 @@ def stock_news(
             "assigned_trading_date": n.assigned_trading_date.isoformat() if n.assigned_trading_date else None,
             "sentiment_score": n.sentiment_score if n.sentiment_score is not None else 0.0,
             "sentiment_label": n.sentiment_label or "neutral",
-            "has_detail": bool(get_original_content_text(n) or n.news_llm_analysis),
-            "has_original_content": bool(get_original_content_text(n)),
-            "content_status": n.content_status,
+            "has_detail": bool(n.content_text or n.content_html or n.news_llm_analysis),
         }
         for n in items
     ]
@@ -342,44 +339,18 @@ def stock_news(
 
 
 @router.get("/news/{news_id}")
-def news_detail(
-    news_id: int,
-    include_html: bool = False,
-    fetch_missing: bool = True,
-    force_fetch: bool = False,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """读取单条新闻详情。
-
-    返回规则：
-    - summary 仍然返回，供前端作为摘要显示；
-    - content_text 只返回数据库里的真实新闻原文，不再把 summary 当作详情正文；
-    - 如果数据库没有原文，fetch_missing=true 时会尝试根据 url 抓取正文并写回数据库。
-    """
+def news_detail(news_id: int, include_html: bool = False, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     n = get_news_or_404(db, news_id)
-
-    if fetch_missing or force_fetch:
-        n = enrich_news_detail_if_needed(
-            db,
-            n,
-            include_html=include_html,
-            force_fetch=force_fetch,
-        )
-
-    original_content_text = get_original_content_text(n)
-    has_original_content = bool(original_content_text)
-
+    # v1.5：新闻详情页按需补正文。批量补正文仍由 news_fulltext 模块负责。
+    n = enrich_news_detail_if_needed(db, n, include_html=include_html, force_fetch=False)
     return ok(
         {
             "news_id": n.id,
             "ticker": n.ticker,
             "title": n.title,
             "summary": n.summary,
-            "content_text": original_content_text,
+            "content_text": n.content_text,
             "content_html": n.content_html if include_html else None,
-            "has_original_content": has_original_content,
-            "detail_source": news_detail_source(n),
             "source": n.source,
             "url": n.url,
             "publish_time": n.publish_time.isoformat() if n.publish_time else None,

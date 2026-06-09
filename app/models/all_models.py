@@ -129,6 +129,44 @@ class PriceData(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
+
+
+class IntradayPriceData(Base):
+    """1 分钟级行情数据。
+
+    v1.5 新增：用于保存 Twelve Data 1min 行情，支持股票详情 range=1d
+    从数据库读取，不再依赖 AKShare/Yahoo 临时抓取。
+    """
+
+    __tablename__ = "intraday_price_data"
+    __table_args__ = (
+        UniqueConstraint(
+            "ticker",
+            "market_timestamp",
+            "interval_type",
+            name="uq_intraday_ticker_timestamp_interval",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(PK_TYPE, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(30), index=True, nullable=False)
+    trading_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    market_timestamp: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    market_time: Mapped[str | None] = mapped_column(String(8))
+    interval_type: Mapped[str] = mapped_column(String(10), default="1m", nullable=False)
+    open: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    high: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    low: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    close: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    volume: Mapped[int | None] = mapped_column(BigInteger)
+    amount: Mapped[float | None] = mapped_column(Numeric(18, 4))
+    vwap: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    source: Mapped[str | None] = mapped_column(String(100))
+    raw_json: Mapped[dict | None] = mapped_column(JSON)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class NewsData(Base):
     __tablename__ = "news_data"
 

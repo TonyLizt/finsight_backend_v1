@@ -91,9 +91,9 @@ def get_default_refresh_modules() -> list[str]:
     """读取每日自动任务模块列表。"""
     modules = _csv(os.getenv("DAILY_AUTO_REFRESH_MODULES"))
     if not modules:
-        modules = ["market", "technical", "news", "sentiment", "features"]
+        modules = ["market", "intraday", "technical", "news", "news_fulltext", "sentiment", "features"]
 
-    allowed = {"market", "technical", "news", "sentiment", "fundamentals", "features"}
+    allowed = {"market", "intraday", "technical", "news", "news_fulltext", "sentiment", "fundamentals", "features"}
     return [m for m in modules if m in allowed]
 
 
@@ -152,7 +152,7 @@ def get_default_refresh_tickers(db: Session, limit: int | None = None) -> list[s
             )
 
     if not tickers:
-        tickers = ["AAPL", "MSFT", "NVDA", "TSLA"]
+        tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META"]
 
     tickers = _dedupe(tickers)
     return tickers[:limit] if limit else tickers

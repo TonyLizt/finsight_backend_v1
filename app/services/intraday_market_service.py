@@ -1,39 +1,30 @@
-"""AKShare intraday hourly market data service.
+"""Twelve Data intraday market data service（v1.5）。
 
 用途：
-- 给 ``GET /api/stocks/{ticker}/detail?range=1d`` 返回美股 1 日小时级走势；
-- 使用 AKShare 的 ``stock_us_hist_min_em`` 获取最近 5 个交易日美股分钟数据；
-- 在服务内按美股交易日和小时聚合为 hourly bars；
-- 抓取失败时返回明确状态，不伪造小时数据。
-
-说明：
-AKShare 美股分时接口的时间字段通常是北京时间，例如美股 09:30 ET
-会显示为北京时间 21:30。这里会转换到 America/New_York 后再按美股交易日过滤。
+- 给 GET /api/stocks/{ticker}/detail?range=1d 返回美股 1 日小时级走势；
+- 优先读取 intraday_price_data 数据库缓存；
+- 数据库缺失时可现场调用 Twelve Data 1min 接口补入库；
+- 不再依赖 AKShare / Yahoo。
 """
 
 from __future__ import annotations
 
-import os
+from collections import defaultdict
 from datetime import date
 from typing import Any
-from zoneinfo import ZoneInfo
 
-import pandas as pd
+from sqlalchemy.orm import Session
 
-SOURCE_TZ = ZoneInfo("Asia/Shanghai")
-MARKET_TZ = ZoneInfo("America/New_York")
-
-
-class AkshareIntradayError(RuntimeError):
-    pass
+from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.all_models import IntradayPriceData
+from app.services.twelvedata_market_service import ensure_extra_tables, ensure_intraday_price_data
 
 
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        if pd.isna(value):
-            return None
         return float(value)
     except Exception:
         return None
@@ -43,199 +34,150 @@ def _to_int(value: Any) -> int | None:
     if value is None:
         return None
     try:
-        if pd.isna(value):
-            return None
         return int(float(value))
     except Exception:
         return None
 
 
-def _candidate_ak_symbols(ticker: str) -> list[str]:
-    """生成 AKShare 美股分时接口的候选 symbol。"""
-    ticker = ticker.upper().strip()
-    env_prefixes = os.getenv("AKSHARE_US_SYMBOL_PREFIXES", "105,106,107")
-    prefixes = [p.strip() for p in env_prefixes.split(",") if p.strip()]
-    candidates = [ticker]
-    candidates.extend(f"{prefix}.{ticker}" for prefix in prefixes)
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in candidates:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
+def _latest_intraday_date(db: Session, ticker: str) -> date | None:
+    row = (
+        db.query(IntradayPriceData.trading_date)
+        .filter(IntradayPriceData.ticker == ticker.upper())
+        .order_by(IntradayPriceData.trading_date.desc())
+        .first()
+    )
+    return row[0] if row else None
 
 
-def _lookup_ak_symbol_from_spot(ticker: str) -> str | None:
-    """通过 stock_us_spot_em 尝试把 AAPL 映射为 105.AAPL 这类代码。"""
-    if os.getenv("AKSHARE_ENABLE_SPOT_SYMBOL_LOOKUP", "1").strip().lower() not in {"1", "true", "yes", "on"}:
-        return None
-
-    try:
-        import akshare as ak  # type: ignore
-    except Exception:
-        return None
-
-    ticker = ticker.upper().strip()
-    try:
-        df = ak.stock_us_spot_em()
-    except Exception:
-        return None
-
-    if df is None or df.empty or "代码" not in df.columns:
-        return None
-
-    for code in df["代码"].astype(str).tolist():
-        if code.upper().endswith(f".{ticker}") or code.upper() == ticker:
-            return code
-    return None
+def _load_minute_rows(db: Session, ticker: str, target_date: date) -> list[IntradayPriceData]:
+    return (
+        db.query(IntradayPriceData)
+        .filter(
+            IntradayPriceData.ticker == ticker.upper(),
+            IntradayPriceData.trading_date == target_date,
+            IntradayPriceData.interval_type == settings.twelvedata_intraday_interval,
+        )
+        .order_by(IntradayPriceData.market_timestamp.asc())
+        .all()
+    )
 
 
-def _fetch_akshare_minute_df(ticker: str) -> tuple[pd.DataFrame, str, list[str]]:
-    """尝试多个 AKShare symbol，返回非空分钟数据。"""
-    try:
-        import akshare as ak  # type: ignore
-    except Exception as exc:
-        raise AkshareIntradayError("akshare is not installed. Install it with: pip install akshare") from exc
+def _aggregate_hourly(rows: list[IntradayPriceData]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[IntradayPriceData]] = defaultdict(list)
+    for row in rows:
+        if not row.market_timestamp:
+            continue
+        hour_start = row.market_timestamp.replace(minute=0, second=0, microsecond=0)
+        buckets[hour_start.isoformat(sep=" ")].append(row)
 
-    errors: list[str] = []
-    candidates = _candidate_ak_symbols(ticker)
-    mapped = _lookup_ak_symbol_from_spot(ticker)
-    if mapped and mapped not in candidates:
-        candidates.insert(0, mapped)
-
-    for symbol in candidates:
-        try:
-            df = ak.stock_us_hist_min_em(symbol=symbol)
-            if df is not None and not df.empty:
-                return df, symbol, errors
-            errors.append(f"{symbol}: empty")
-        except Exception as exc:
-            errors.append(f"{symbol}: {exc}")
-
-    raise AkshareIntradayError("; ".join(errors) if errors else "AKShare returned no data")
-
-
-def _normalize_minute_df(df: pd.DataFrame) -> pd.DataFrame:
-    """把 AKShare 中文列名分钟数据标准化。"""
-    required = {"时间", "开盘", "收盘", "最高", "最低", "成交量"}
-    missing = required - set(df.columns)
-    if missing:
-        raise AkshareIntradayError(f"AKShare minute dataframe missing columns: {sorted(missing)}")
-
-    out = df.copy()
-    out["source_datetime"] = pd.to_datetime(out["时间"], errors="coerce")
-    out = out.dropna(subset=["source_datetime"])
-    if out.empty:
-        raise AkshareIntradayError("AKShare minute dataframe has no valid 时间")
-
-    out["source_datetime"] = out["source_datetime"].dt.tz_localize(SOURCE_TZ, nonexistent="shift_forward", ambiguous="NaT")
-    out["market_datetime"] = out["source_datetime"].dt.tz_convert(MARKET_TZ)
-    out["market_date"] = out["market_datetime"].dt.date
-
-    for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "最新价"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-
-    if "开盘" in out.columns and "收盘" in out.columns:
-        out.loc[(out["开盘"].isna()) | (out["开盘"] <= 0), "开盘"] = out["收盘"]
-    return out
-
-
-def _aggregate_hourly(df: pd.DataFrame, target_date: date | None) -> tuple[pd.DataFrame, date | None]:
-    if target_date is None:
-        target_date = max(df["market_date"].tolist())
-
-    day_df = df[df["market_date"] == target_date].copy()
-    if day_df.empty:
-        return day_df, target_date
-
-    day_df = day_df.set_index("market_datetime").sort_index()
-
-    agg_spec: dict[str, str] = {
-        "开盘": "first",
-        "最高": "max",
-        "最低": "min",
-        "收盘": "last",
-        "成交量": "sum",
-    }
-    if "成交额" in day_df.columns:
-        agg_spec["成交额"] = "sum"
-    if "最新价" in day_df.columns:
-        agg_spec["最新价"] = "last"
-
-    agg = day_df.resample("60min", label="left", closed="left").agg(agg_spec)
-    agg = agg.dropna(subset=["收盘"])
-    return agg, target_date
+    items: list[dict[str, Any]] = []
+    for _, bucket in sorted(buckets.items(), key=lambda x: x[0]):
+        bucket = sorted(bucket, key=lambda r: r.market_timestamp)
+        first = bucket[0]
+        last = bucket[-1]
+        highs = [_to_float(r.high) for r in bucket if r.high is not None]
+        lows = [_to_float(r.low) for r in bucket if r.low is not None]
+        volumes = [_to_int(r.volume) or 0 for r in bucket]
+        market_dt = first.market_timestamp.replace(minute=0, second=0, microsecond=0)
+        items.append(
+            {
+                "timestamp": market_dt.isoformat(),
+                "date": market_dt.date().isoformat(),
+                "time": market_dt.strftime("%H:%M"),
+                "open": _to_float(first.open),
+                "high": max(highs) if highs else None,
+                "low": min(lows) if lows else None,
+                "close": _to_float(last.close),
+                "volume": sum(volumes),
+                "amount": None,
+                "latest_price": _to_float(last.close),
+                "data_frequency": "hourly",
+                "source": "mysql_intraday_price_data:twelvedata_1min_aggregated",
+            }
+        )
+    return items
 
 
 def get_hourly_intraday_curve(ticker: str, target_date: date | None = None) -> dict[str, Any]:
     """返回美股某日小时级走势。
 
-    target_date 为美股市场日期；不传时取 AKShare 返回数据中的最新美股交易日。
+    target_date 为美股市场日期；不传时取 intraday_price_data 中最新交易日。
+    如果数据库没有分钟行情，且 FINSIGHT_ENABLE_ON_DEMAND_INGEST=true，
+    会现场调用 Twelve Data 1min 接口补入库后再读库返回。
     """
     ticker = ticker.upper().strip()
-    try:
-        raw_df, ak_symbol, candidate_errors = _fetch_akshare_minute_df(ticker)
-        minute_df = _normalize_minute_df(raw_df)
-        hourly_df, actual_date = _aggregate_hourly(minute_df, target_date)
+    ensure_extra_tables()
 
-        if hourly_df.empty:
+    db = SessionLocal()
+    ingest_result: dict[str, Any] | None = None
+    try:
+        actual_date = target_date or _latest_intraday_date(db, ticker)
+
+        if actual_date is None or not _load_minute_rows(db, ticker, actual_date):
+            if settings.finsight_enable_on_demand_ingest:
+                ingest_result = ensure_intraday_price_data(db, ticker, target_date=target_date)
+                actual_date = target_date or _latest_intraday_date(db, ticker)
+            else:
+                ingest_result = {
+                    "status": "skipped",
+                    "message": "on-demand intraday ingest disabled",
+                }
+
+        if actual_date is None:
             return {
                 "status": "empty",
-                "source": "akshare_stock_us_hist_min_em",
+                "source": "mysql_intraday_price_data",
                 "data_frequency": "hourly",
                 "ticker": ticker,
-                "ak_symbol": ak_symbol,
+                "ak_symbol": None,
                 "target_date": target_date.isoformat() if target_date else None,
-                "actual_date": actual_date.isoformat() if actual_date else None,
+                "actual_date": None,
                 "items": [],
-                "message": "AKShare returned minute data, but no bars for target market date",
-                "candidate_errors": candidate_errors,
+                "message": "no intraday rows in database",
+                "ingest_result": ingest_result,
             }
 
-        items: list[dict[str, Any]] = []
-        for idx, row in hourly_df.iterrows():
-            market_dt = idx.to_pydatetime()
-            items.append(
-                {
-                    "timestamp": market_dt.isoformat(),
-                    "date": market_dt.date().isoformat(),
-                    "time": market_dt.strftime("%H:%M"),
-                    "open": _to_float(row.get("开盘")),
-                    "high": _to_float(row.get("最高")),
-                    "low": _to_float(row.get("最低")),
-                    "close": _to_float(row.get("收盘")),
-                    "volume": _to_int(row.get("成交量")),
-                    "amount": _to_float(row.get("成交额")) if "成交额" in hourly_df.columns else None,
-                    "latest_price": _to_float(row.get("最新价")) if "最新价" in hourly_df.columns else None,
-                    "data_frequency": "hourly",
-                    "source": "akshare_stock_us_hist_min_em",
-                }
-            )
+        rows = _load_minute_rows(db, ticker, actual_date)
+        if not rows:
+            return {
+                "status": "empty",
+                "source": "mysql_intraday_price_data",
+                "data_frequency": "hourly",
+                "ticker": ticker,
+                "ak_symbol": None,
+                "target_date": target_date.isoformat() if target_date else None,
+                "actual_date": actual_date.isoformat(),
+                "items": [],
+                "message": "no minute rows for target market date",
+                "ingest_result": ingest_result,
+            }
 
+        items = _aggregate_hourly(rows)
         return {
             "status": "success",
-            "source": "akshare_stock_us_hist_min_em",
+            "source": "mysql_intraday_price_data:twelvedata",
             "data_frequency": "hourly",
             "ticker": ticker,
-            "ak_symbol": ak_symbol,
+            "ak_symbol": None,
             "target_date": target_date.isoformat() if target_date else None,
-            "actual_date": actual_date.isoformat() if actual_date else None,
+            "actual_date": actual_date.isoformat(),
             "items": items,
             "message": "ok",
-            "candidate_errors": candidate_errors,
+            "minute_count": len(rows),
+            "ingest_result": ingest_result,
         }
-
     except Exception as exc:
         return {
             "status": "failed",
-            "source": "akshare_stock_us_hist_min_em",
+            "source": "mysql_intraday_price_data:twelvedata",
             "data_frequency": "hourly",
             "ticker": ticker,
             "target_date": target_date.isoformat() if target_date else None,
             "actual_date": None,
             "items": [],
-            "message": "AKShare hourly intraday fetch failed",
+            "message": "Twelve Data intraday read/fetch failed",
             "error": str(exc),
+            "ingest_result": ingest_result,
         }
+    finally:
+        db.close()

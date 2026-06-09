@@ -44,9 +44,11 @@ from sqlalchemy.orm import Session
 from app.services.feature_snapshot_service import ensure_latest_feature_snapshot
 from app.services.indicator_service import rebuild_technical_indicators_for_ticker
 from app.services.market_data_service import ensure_price_data
+from app.services.news_detail_fetch_service import enrich_news_detail_if_needed
+from app.services.twelvedata_market_service import ensure_intraday_price_data, previous_completed_market_date
 
 
-DEFAULT_MODULES = ["market", "technical", "features"]
+DEFAULT_MODULES = ["market", "intraday", "technical", "news", "news_fulltext", "sentiment", "features"]
 
 
 def _to_date(value: Any) -> date | None:
@@ -395,6 +397,34 @@ def run_market_module(
     )
     result["module"] = "market"
     return result
+
+def run_intraday_module(
+    db: Session,
+    ticker: str,
+    end_date: date | None,
+    force_refresh: bool,
+) -> dict[str, Any]:
+    """分钟行情模块：Twelve Data 1min → intraday_price_data。
+
+    v1.5 修复：分钟行情默认抓 price_data 中最近一个完整日频交易日，
+    而不是当前自然日/盘中日期。这样日频最新到 2026-06-08 时，
+    分钟行情也抓 2026-06-08 的 09:30~16:00，避免写入 2026-06-09
+    这种盘中残缺数据。
+    """
+    # end_date 可能是今日/当前市场日，但 price_data 的 MAX(trading_date)
+    # 才代表后端已经确认过的最近完整交易日。
+    target_intraday_date = _latest_price_date(db, ticker, end_date)
+
+    result = ensure_intraday_price_data(
+        db=db,
+        ticker=ticker,
+        target_date=target_intraday_date,
+        force_refresh=force_refresh,
+    )
+    result["module"] = "intraday"
+    result["target_intraday_date"] = target_intraday_date.isoformat() if target_intraday_date else None
+    return result
+
 
 def run_technical_module(
     db: Session,
@@ -963,6 +993,76 @@ def run_news_module_placeholder(ticker: str) -> dict[str, Any]:
     }
 
 
+def run_news_fulltext_module(
+    db: Session,
+    ticker: str,
+    start_date: date | None,
+    end_date: date | None,
+    force_refresh: bool,
+) -> dict[str, Any]:
+    """新闻正文批量补全模块。
+
+    扫描 news_data 中正文未抓取/抓取失败的新闻，调用现有正文抓取服务补 content_text。
+    已经 fetched 且 content_text 非空的新闻默认跳过，避免失败状态覆盖成功正文。
+    """
+    if not _table_exists(db, "news_data"):
+        return {
+            "module": "news_fulltext",
+            "ticker": ticker,
+            "status": "failed",
+            "can_continue": False,
+            "message": "news_data table does not exist",
+        }
+
+    from app.models.all_models import NewsData
+
+    limit = int(os.getenv("NEWS_FULLTEXT_BATCH_LIMIT", "50"))
+    q = db.query(NewsData).filter(NewsData.ticker == ticker)
+    if start_date:
+        q = q.filter(NewsData.publish_time >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        q = q.filter(NewsData.publish_time <= datetime.combine(end_date, datetime.max.time()))
+
+    if not force_refresh:
+        q = q.filter(
+            (NewsData.content_text.is_(None))
+            | (NewsData.content_text == "")
+            | (NewsData.content_status.in_(["not_fetched", "summary_only", "fetch_failed", "empty", "blocked", None]))
+        )
+
+    rows = q.order_by(NewsData.publish_time.desc()).limit(max(1, limit)).all()
+    fetched = 0
+    failed = 0
+    skipped = 0
+
+    for news in rows:
+        old_text = news.content_text
+        old_status = news.content_status
+        # 避免失败状态覆盖已有成功正文。
+        if old_text and old_status == "fetched" and not force_refresh:
+            skipped += 1
+            continue
+        enrich_news_detail_if_needed(db, news, include_html=False, force_fetch=force_refresh)
+        if news.content_text and news.content_status == "fetched":
+            fetched += 1
+        else:
+            failed += 1
+
+    status = "updated" if fetched else "empty" if not rows else "partial_success"
+    return {
+        "module": "news_fulltext",
+        "ticker": ticker,
+        "status": status,
+        "can_continue": True,
+        "fetched_count": len(rows),
+        "inserted_count": 0,
+        "updated_count": fetched,
+        "failed_count": failed,
+        "skipped_count": skipped,
+        "message": "news content_text batch enrichment finished",
+    }
+
+
 def run_sentiment_module(
     db: Session,
     ticker: str,
@@ -1103,7 +1203,7 @@ def _pipeline_step_changed(result: dict[str, Any]) -> bool:
         updated = int(result.get("updated") or result.get("updated_count") or 0)
 
         module = result.get("module")
-        if module in {"news", "sentiment", "technical", "market"}:
+        if module in {"news", "news_fulltext", "sentiment", "technical", "market", "intraday"}:
             return (inserted + updated) > 0 or module == "technical"
 
         return True
@@ -1168,6 +1268,8 @@ def run_data_pipeline_job(
             try:
                 if module == "market":
                     result = run_market_module(db, ticker, end_date, force_refresh)
+                elif module == "intraday":
+                    result = run_intraday_module(db, ticker, end_date, force_refresh)
                 elif module == "technical":
                     result = run_technical_module(db, ticker, end_date, force_refresh)
                 elif module == "features":
@@ -1182,6 +1284,8 @@ def run_data_pipeline_job(
                         upstream_changed = False
                 elif module == "news":
                     result = run_news_module(db, ticker, start_date, end_date, force_refresh)
+                elif module == "news_fulltext":
+                    result = run_news_fulltext_module(db, ticker, start_date, end_date, force_refresh)
                 elif module == "sentiment":
                     result = run_sentiment_module(db, ticker, start_date, end_date, force_refresh)
                 elif module == "fundamentals":

@@ -2,19 +2,16 @@
 
 本服务用于为股票详情、预测、回测准备最新可用的日频行情数据。
 
-当前版本的核心策略：
-1. 默认不依赖 B 同学的本地 raw CSV；
-2. 优先使用 Alpha Vantage 官方 API 自行拉取日频行情；
-3. Alpha Vantage 不可用时，尝试 Yahoo Chart 作为兜底；
+v1.5 核心策略：
+1. 行情数据源统一使用 Twelve Data；
+2. 不再调用 Alpha Vantage 行情、Yahoo Chart 或 AKShare；
+3. 每次补全会先读取数据库最新 trading_date，再从最新日期附近继续增量抓取；
 4. 如果线上抓取失败，必须明确返回 failed 或 cached_with_fetch_failed；
-5. 如果数据库缓存存在明显异常价格，不允许继续生成新的模型特征快照；
-6. 所有写入字段尽量与 B 同学已有 price_data / import_price_csv.py 的字段保持一致。
+5. 如果数据库缓存存在明显异常价格，不允许继续生成新的模型特征快照。
 
 需要的环境变量：
-- ALPHA_VANTAGE_API_KEY=你的 Alpha Vantage API Key
-- MARKET_DATA_PRIMARY_SOURCE=alpha_vantage
-- ENABLE_YAHOO_CHART_FALLBACK=1
-- ENABLE_LOCAL_RAW_CSV_FALLBACK=0
+- TWELVEDATA_API_KEY=你的 Twelve Data API Key
+- TWELVEDATA_TIMEZONE=America/New_York
 """
 
 from __future__ import annotations
@@ -314,10 +311,11 @@ def _normalize_price_record(ticker: str, row: dict[str, Any], source: str) -> di
     if previous_close is not None and previous_close > 0:
         change_amount = close_price - previous_close
         daily_return = change_amount / previous_close
-        change_percent = daily_return * 100
+        # 数据库中仍保存“比例值”；stock_service.display_change_percent 会负责转成百分数展示。
+        change_percent = daily_return
 
         if high_price is not None and low_price is not None:
-            amplitude = (high_price - low_price) / previous_close * 100
+            amplitude = (high_price - low_price) / previous_close
 
     return {
         "ticker": ticker.upper(),
@@ -351,15 +349,88 @@ def _add_previous_close(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record["previous_close"] = previous_close
             record["change_amount"] = close - previous_close
             record["daily_return"] = (close - previous_close) / previous_close
-            record["change_percent"] = record["daily_return"] * 100
+            # 数据库中保存比例值，API 展示层再转成百分数，保持旧接口兼容。
+            record["change_percent"] = record["daily_return"]
 
             if high is not None and low is not None:
-                record["amplitude"] = (high - low) / previous_close * 100
+                record["amplitude"] = (high - low) / previous_close
 
         if close is not None and close > 0:
             previous_close = close
 
     return records
+
+
+def _previous_close_before(db: Session, ticker: str, trading_date: date) -> float | None:
+    """读取某个交易日前一条有效 close，用于增量抓取窗口的首日计算。"""
+    row = db.execute(
+        text(
+            """
+            SELECT close
+            FROM price_data
+            WHERE ticker = :ticker
+              AND trading_date < :trading_date
+              AND close IS NOT NULL
+            ORDER BY trading_date DESC
+            LIMIT 1
+            """
+        ),
+        {"ticker": ticker.upper(), "trading_date": trading_date},
+    ).first()
+    if not row or row[0] is None:
+        return None
+    return _to_float(row[0])
+
+
+def _prepare_price_records_for_upsert(db: Session, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """给即将 upsert 的行情补齐 previous_close / change / return / amplitude。
+
+    Twelve Data 返回的 OHLCV 不包含 previous_close。v1.5 第一版直接 upsert，
+    会把 price_data 中 change_percent / daily_return / amplitude 覆盖成 NULL，
+    前端再把 NULL 当 0 展示，造成“股票变化率变成 0”。
+
+    这里按 ticker 分组、按 trading_date 排序；每组首日从数据库中读取该日之前
+    最近一条 close，后续日期用本次 records 内的前一日 close 递推。
+    """
+    if not records:
+        return []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw in records:
+        ticker = str(raw.get("ticker") or "").upper().strip()
+        if not ticker:
+            continue
+        grouped.setdefault(ticker, []).append(dict(raw))
+
+    prepared: list[dict[str, Any]] = []
+
+    for ticker, rows in grouped.items():
+        rows.sort(key=lambda item: item["trading_date"])
+        previous_close = _previous_close_before(db, ticker, rows[0]["trading_date"]) if rows else None
+
+        for record in rows:
+            close = _to_float(record.get("close"))
+            high = _to_float(record.get("high"))
+            low = _to_float(record.get("low"))
+
+            if previous_close is not None and previous_close > 0 and close is not None:
+                change_amount = close - previous_close
+                daily_return = change_amount / previous_close
+                record["previous_close"] = previous_close
+                record["change_amount"] = change_amount
+                record["daily_return"] = daily_return
+                # 兼容旧接口：DB 存比例值，stock_service.display_change_percent 负责展示百分数。
+                record["change_percent"] = daily_return
+                if high is not None and low is not None:
+                    record["amplitude"] = (high - low) / previous_close
+
+            if close is not None and close > 0:
+                previous_close = close
+
+            prepared.append(record)
+
+    prepared.sort(key=lambda item: (item.get("ticker") or "", item.get("trading_date")))
+    return prepared
 
 
 def _alpha_vantage_request(params: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
@@ -621,6 +692,10 @@ def upsert_price_records(db: Session, records: list[dict[str, Any]]) -> tuple[in
     if not records:
         return 0, 0
 
+    records = _prepare_price_records_for_upsert(db, records)
+    if not records:
+        return 0, 0
+
     cols = _table_columns(db, "price_data")
     if not cols:
         raise RuntimeError("price_data table not found")
@@ -692,56 +767,23 @@ def fetch_online_price_records(
     start_date: date,
     end_date: date,
 ) -> tuple[list[dict[str, Any]], str, list[str]]:
-    """按配置抓取行情：Yahoo Chart 优先，不再使用 Alpha Vantage 行情接口。
+    """按 v1.5 配置抓取日频行情：只使用 Twelve Data。
 
-    v1.3 Yahoo market 策略：
-    1. 默认只尝试 Yahoo Chart；
-    2. 可选 local_raw_csv fallback；
-    3. 即使 MARKET_DATA_SOURCE_PRIORITY 中仍写 alpha_vantage，也会自动忽略；
-    4. 新闻抓取不受影响，Alpha Vantage News Sentiment 仍可继续用于 news_data。
+    重要：
+    - 行情数据源统一为 twelvedata.com；
+    - 不再调用 Alpha Vantage 行情、Yahoo Chart、AKShare；
+    - Alpha Vantage 仍可继续作为新闻/基本面数据源，不受本函数影响。
     """
-    raw_priority = os.getenv("MARKET_DATA_SOURCE_PRIORITY", "yahoo_chart,local_raw_csv")
-    source_priority = [item.strip().lower() for item in raw_priority.split(",") if item.strip()]
-
-    # 行情链路不再调用 Alpha Vantage，避免 premium endpoint / free rate limit。
-    source_priority = [
-        item
-        for item in source_priority
-        if item not in {"alpha_vantage", "alphavantage", "av"}
-    ]
-
-    if not source_priority:
-        source_priority = ["yahoo_chart", "local_raw_csv"]
-
     errors: list[str] = []
+    try:
+        from app.services.twelvedata_market_service import fetch_daily_records
 
-    for source in source_priority:
-        try:
-            if source in {"yahoo", "yahoo_chart"}:
-                if not _env_bool("ENABLE_YAHOO_CHART_FALLBACK", True):
-                    errors.append("yahoo_chart disabled by ENABLE_YAHOO_CHART_FALLBACK=0")
-                    continue
-
-                records = fetch_yahoo_chart_prices(ticker, start_date, end_date)
-                if records:
-                    return records, "yahoo_chart", errors
-                errors.append("yahoo_chart returned no records")
-
-            elif source in {"local", "local_raw_csv"}:
-                if not _env_bool("ENABLE_LOCAL_RAW_CSV_FALLBACK", False):
-                    errors.append("local_raw_csv disabled by ENABLE_LOCAL_RAW_CSV_FALLBACK=0")
-                    continue
-
-                records, path = fetch_local_raw_csv_prices(ticker, start_date, end_date)
-                if records:
-                    return records, f"local_raw_csv:{path}", errors
-                errors.append("local_raw_csv returned no records")
-
-            else:
-                errors.append(f"unknown or disabled market data source: {source}")
-
-        except Exception as exc:
-            errors.append(f"{source} failed: {exc}")
+        records = fetch_daily_records(ticker, start_date, end_date)
+        if records:
+            return records, "twelvedata:time_series:1day", errors
+        errors.append("twelvedata returned no records")
+    except Exception as exc:
+        errors.append(f"twelvedata failed: {exc}")
 
     return [], "", errors
 
@@ -756,10 +798,10 @@ def ensure_price_data(
 ) -> dict[str, Any]:
     """确保 price_data 中有某 ticker 的最新可用日频行情。
 
-    线上自爬规则：
+    v1.5 线上自爬规则：
     1. 非强制刷新时，如果缓存新鲜且质量正常，直接返回 cached；
-    2. 需要刷新时，按 MARKET_DATA_SOURCE_PRIORITY 自行爬取；
-    3. 默认使用与 B 同学脚本一致的 Yahoo Chart，不依赖 B 同学本地 CSV；
+    2. 需要刷新时，只调用 Twelve Data 自行爬取；
+    3. 每次根据数据库已有最新日期增量补齐，不从头全量抓；
     4. 抓取失败且 force_refresh=True 时，返回 failed，不继续预测；
     5. 抓取失败但缓存质量正常且 force_refresh=False 时，允许使用缓存；
     6. 发现异常价格时返回 failed，阻止生成新 feature snapshot。
@@ -794,9 +836,10 @@ def ensure_price_data(
 
     start_date = target_date - timedelta(days=min_history_days + 30)
 
-    # 非强制刷新时，已有数据可减少爬取窗口；强制刷新保留较长窗口以覆盖坏数据。
+    # 非强制刷新时，从数据库最新交易日附近继续抓，保留 1 天重叠用于修正最新 K 线。
+    # 不再从历史起点全量抓到今天。
     if latest_date and not force_refresh:
-        start_date = max(start_date, latest_date - timedelta(days=10))
+        start_date = max(start_date, latest_date - timedelta(days=1))
 
     records, source, errors = fetch_online_price_records(ticker, start_date, target_date)
 
