@@ -19,3 +19,4 @@ joblib
 xgboost
 pyarrow
 akshare>=1.18.0
+matplotlib

@@ -167,7 +167,8 @@ def _get_strategy_params(run: BacktestRun) -> dict[str, Any]:
     params.setdefault("animation_mode", "realtime")
 
     # 以下是回测策略内部参数，前端不传也能稳定运行。
-    params.setdefault("buy_score_threshold", 62.0)
+    params.setdefault("buy_score_threshold", 54.0)
+    params.setdefault("buy_situation_threshold", 59.0)
     params.setdefault("sell_score_threshold", 42.0)
     params.setdefault("take_profit_pct", 0.18)
     params.setdefault("stop_loss_pct", -0.08)
@@ -502,8 +503,8 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
 
             if signal["stock_score"] < float(params["buy_score_threshold"]):
                 continue
-
-            if signal["situation_score"] < 45:
+            
+            if signal["situation_score"] < float(params["buy_situation_threshold"]):
                 continue
 
             price = _current_price(day_prices.get(ticker))
