@@ -833,13 +833,21 @@ def _load_benchmark_map(
     start_date: date,
     end_date: date,
 ) -> dict[date, PriceData]:
+    """加载基准行情数据。
+    
+    1. benchmark 默认使用 SPY，即追踪 S&P 500 的可交易 ETF。
+    2. 这里统一 upper，避免前端传 spy / Spy 时查不到数据。
+    3. benchmark_return 允许使用区间内最近可用交易日价格计算，避免因为日期不完全对齐导致 null。
+    """
     if not benchmark:
         return {}
+
+    benchmark_ticker = benchmark.strip().upper()
 
     rows = (
         db.query(PriceData)
         .filter(
-            PriceData.ticker == benchmark.upper(),
+            PriceData.ticker == benchmark_ticker,
             PriceData.trading_date >= start_date,
             PriceData.trading_date <= end_date,
             PriceData.close.isnot(None),
@@ -847,19 +855,54 @@ def _load_benchmark_map(
         .order_by(PriceData.trading_date.asc())
         .all()
     )
-    return {r.trading_date: r for r in rows}
 
+    return {r.trading_date: r for r in rows}
 
 def _first_available_benchmark_price(
     benchmark_map: dict[date, PriceData],
     trading_days: list[date],
 ) -> float | None:
-    for trading_day in trading_days:
+    """返回 benchmark 在回测区间内的第一笔可用价格。
+    
+    原本逻辑要求 benchmark 日期必须刚好等于股票池交易日。
+    如果 SPY 数据存在，但日期和股票池交易日不完全对齐，就会导致 benchmark_base_price=None。
+    这里改为直接从 benchmark_map 中取第一笔有效价格，更稳。
+    """
+    if not benchmark_map:
+        return None
+
+    for trading_day in sorted(benchmark_map.keys()):
         price = _current_price(benchmark_map.get(trading_day))
-        if price and price > 0:
+        if price is not None and price > 0:
             return price
+
     return None
 
+def _benchmark_price_on_or_before(
+    benchmark_map: dict[date, PriceData],
+    trading_day: date,
+) -> float | None:
+    """获取指定日期当日或之前最近一日的 benchmark 收盘价。
+
+    备注：
+    组合回测交易日来自股票池，例如 AAPL / MSFT / NVDA。
+    benchmark 使用 SPY 时，理论上交易日应大致一致，但实际落库时可能出现：
+    1. SPY 数据缺某一天；
+    2. 股票池最后交易日和 SPY 最后交易日不完全一致；
+    3. 用户后补 SPY 数据后，日期范围不是完全从 start_date 开始。
+
+    因此这里使用 <= trading_day 的最近一笔 benchmark 价格兜底。
+    """
+    if not benchmark_map:
+        return None
+
+    available_dates = [d for d in benchmark_map.keys() if d <= trading_day]
+
+    if not available_dates:
+        return None
+
+    nearest_date = max(available_dates)
+    return _current_price(benchmark_map.get(nearest_date))
 
 def _benchmark_metrics(
     benchmark_map: dict[date, PriceData],
@@ -867,7 +910,12 @@ def _benchmark_metrics(
     trading_day: date,
     initial_cash: float,
 ) -> tuple[float | None, float | None]:
-    price = _current_price(benchmark_map.get(trading_day))
+    """计算 benchmark 当前价值和收益率。
+    
+    使用 trading_day 当天或之前最近一笔 benchmark 价格。
+    这样即使 SPY 某一天缺数据，也不会直接导致 benchmark_return=null。
+    """
+    price = _benchmark_price_on_or_before(benchmark_map, trading_day)
 
     if price is None or benchmark_base_price is None or benchmark_base_price <= 0:
         return None, None
@@ -958,8 +1006,8 @@ def _build_signal(
     stock_score = _clamp(stock_score, 0, 100)
     situation_score = _clamp(situation_score, 0, 100)
     predicted_growth_prob = stock_score / 100
-
-    if stock_score >= 62 and situation_score >= 45:
+    
+    if stock_score >= 54 and situation_score >= 59:
         action_hint = "buy"
     elif stock_score <= 42 or situation_score <= 35:
         action_hint = "sell"

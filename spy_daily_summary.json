@@ -1,0 +1,46 @@
+{
+  "task": "finsight_sp500_daily_backfill",
+  "target_table": "price_data",
+  "granularity": "1day",
+  "started_at": "2026-06-10T15:58:50",
+  "finished_at": "2026-06-10T15:58:51",
+  "start_date": "2023-01-03",
+  "end_date": "2026-06-10",
+  "ticker_count": 1,
+  "counts": {
+    "updated": 1,
+    "cached": 0,
+    "empty": 0,
+    "failed": 0,
+    "resumed": 0
+  },
+  "log_file": "spy_daily_log.jsonl",
+  "items": [
+    {
+      "ticker": "SPY",
+      "status": "updated",
+      "start_date": "2026-05-30",
+      "end_date": "2026-06-10",
+      "db_min_before": "2023-01-03",
+      "db_max_before": "2026-05-29",
+      "db_rows_before": 854,
+      "db_min_after": "2023-01-03",
+      "db_max_after": "2026-06-09",
+      "db_rows_after": 861,
+      "source_symbol": "SPY",
+      "fetched_count": 7,
+      "inserted_count": 7,
+      "updated_count": 0,
+      "repair_result": {
+        "ticker": "SPY",
+        "status": "updated",
+        "rows": 861,
+        "updated": 861,
+        "first_rows_without_previous_close": 1
+      },
+      "indicator_result": null,
+      "error": null,
+      "elapsed_sec": 1.249
+    }
+  ]
+}
