@@ -84,7 +84,7 @@ def stock_detail(
         # 可选刷新：股票详情默认读库，传 auto_refresh=true 时尝试用 Twelve Data
         # 增量补齐最新可用日频行情；range=1d 会优先读 intraday_price_data，
         # 缺失时由 Twelve Data 1min 分时数据现场补入库。
-        # interval=1min 时返回分钟级曲线；默认返回 hourly 聚合以兼容旧前端。
+        # 默认返回 1min 分钟级曲线；传 interval=hourly 时返回小时级聚合。
         refresh_status = ensure_price_data(db, ticker, force_refresh=force_refresh)
         rebuild_technical_indicators_for_ticker(db, ticker)
 
@@ -107,7 +107,7 @@ def stock_detail(
     intraday_status = None
 
     def normalize_intraday_interval(value: str | None) -> str:
-        normalized = (value or "hourly").strip().lower().replace("_", "-")
+        normalized = (value or "1min").strip().lower().replace("_", "-")
         if normalized in {"1min", "1-min", "1minute", "1-minute", "minute", "minutes", "min", "m1", "1m"}:
             return "1min"
         if normalized in {"hourly", "hour", "hours", "1h", "h1", "60min", "60-min"}:
@@ -117,8 +117,8 @@ def stock_detail(
     intraday_interval = normalize_intraday_interval(interval)
 
     if is_intraday_range:
-        # 1d 图默认使用 intraday_price_data 中的 Twelve Data 1min 数据聚合成小时级；
-        # 传 interval=1min 时直接返回原始分钟级曲线。
+        # 1d 图默认直接返回 intraday_price_data 中的 Twelve Data 1min 数据；
+        # 传 interval=hourly 时返回小时级聚合曲线。
         # 数据库缺失时可现场调用 Twelve Data 补入库。
         intraday_result = get_intraday_curve(ticker, target_date=None, interval=intraday_interval)
         price_curve_items = intraday_result.get("items", [])
