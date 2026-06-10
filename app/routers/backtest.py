@@ -4,7 +4,7 @@
 """
 
 from datetime import date
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
@@ -14,6 +14,7 @@ from app.models.all_models import User, PortfolioSnapshot, BacktestEventLog, Use
 from app.schemas.backtest import BacktestRunRequest
 from app.services.backtest_service import (
     create_backtest_run,
+    execute_backtest_run,
     get_run_for_user,
     run_status,
     build_day_detail,
@@ -30,8 +31,17 @@ router = APIRouter(prefix="/api/backtest", tags=["Backtest API"])
 
 
 @router.post("/run")
-def run(req: BacktestRunRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def run(
+    req: BacktestRunRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     backtest = create_backtest_run(db, user.id, req)
+
+    # 创建任务后立即放入 FastAPI 后台任务，接口先返回 run_id，后台逐日写入 frames / logs / summary。
+    background_tasks.add_task(execute_backtest_run, backtest.id)
+
     write_operation_log(db, user.id, "BacktestService", "create_backtest_run", "success", f"run_id={backtest.id}")
     return ok(
         {
@@ -106,12 +116,28 @@ def frames(
     for s in snapshots:
         positions = []
         if include_positions:
-            pos_rows = db.query(BacktestDailyPosition).filter(BacktestDailyPosition.run_id == run.id, BacktestDailyPosition.snapshot_date == s.snapshot_date).all()
+            pos_rows = (
+                db.query(BacktestDailyPosition)
+                .filter(
+                    BacktestDailyPosition.run_id == run.id,
+                    BacktestDailyPosition.snapshot_date == s.snapshot_date,
+                )
+                .order_by(BacktestDailyPosition.ticker.asc(), BacktestDailyPosition.buy_date.asc())
+                .all()
+            )
             positions = [position_to_dict(db, p) for p in pos_rows]
             if not include_position_curves:
                 for p in positions:
                     p["price_curve_from_buy"] = []
-        trade_rows = db.query(BacktestTrade).filter(BacktestTrade.run_id == run.id, BacktestTrade.trade_date == s.snapshot_date).all()
+        trade_rows = (
+            db.query(BacktestTrade)
+            .filter(
+                BacktestTrade.run_id == run.id,
+                BacktestTrade.trade_date == s.snapshot_date,
+            )
+            .order_by(BacktestTrade.id.asc())
+            .all()
+        )
         log_count = db.query(BacktestEventLog).filter(BacktestEventLog.run_id == run.id, BacktestEventLog.trading_date == s.snapshot_date).count()
         frame_items.append(
             {
@@ -164,6 +190,35 @@ def logs(
 @router.get("/{run_id}/summary")
 def summary(run_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     run = get_run_for_user(db, run_id, user.id, user.role.role_name == "admin")
+
+    # summary 只返回最终汇总；total_value / cash / stock_value 从最终快照兜底读取，避免前端缺字段。
+    final_snapshot = None
+
+    if run.final_snapshot_date:
+        final_snapshot = (
+            db.query(PortfolioSnapshot)
+            .filter(
+                PortfolioSnapshot.run_id == run.id,
+                PortfolioSnapshot.snapshot_date == run.final_snapshot_date,
+            )
+            .first()
+        )
+
+    if not final_snapshot:
+        final_snapshot = (
+            db.query(PortfolioSnapshot)
+            .filter(PortfolioSnapshot.run_id == run.id)
+            .order_by(PortfolioSnapshot.snapshot_date.desc())
+            .first()
+        )
+
+    final_equity = float(run.final_equity) if run.final_equity is not None else None
+    total_value = (
+        float(final_snapshot.total_value)
+        if final_snapshot and final_snapshot.total_value is not None
+        else final_equity
+    )
+
     return ok(
         {
             "run_id": run.id,
@@ -173,7 +228,10 @@ def summary(run_id: int, db: Session = Depends(get_db), user: User = Depends(get
             "end_date": run.end_date.isoformat() if run.end_date else None,
             "initial_cash": float(run.initial_cash) if run.initial_cash is not None else None,
             "final_snapshot_date": run.final_snapshot_date.isoformat() if run.final_snapshot_date else None,
-            "final_equity": float(run.final_equity) if run.final_equity is not None else None,
+            "final_equity": final_equity,
+            "total_value": total_value,
+            "stock_value": float(final_snapshot.stock_value) if final_snapshot and final_snapshot.stock_value is not None else None,
+            "cash": float(final_snapshot.cash) if final_snapshot and final_snapshot.cash is not None else None,
             "total_return": run.total_return,
             "annual_return": run.annual_return,
             "max_drawdown": run.max_drawdown,
@@ -185,7 +243,6 @@ def summary(run_id: int, db: Session = Depends(get_db), user: User = Depends(get
             "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         }
     )
-
 
 @router.get("/{run_id}/final-positions")
 def final_positions_by_run(run_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
