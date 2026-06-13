@@ -23,6 +23,7 @@ from app.services.backtest_service import (
     trade_to_dict,
     log_to_dict,
     final_positions,
+    sort_position_items,
 )
 from app.models.all_models import BacktestDailyPosition, BacktestTrade
 from app.services.log_service import write_operation_log
@@ -125,7 +126,7 @@ def frames(
                 .order_by(BacktestDailyPosition.ticker.asc(), BacktestDailyPosition.buy_date.asc())
                 .all()
             )
-            positions = [position_to_dict(db, p) for p in pos_rows]
+            positions = sort_position_items([position_to_dict(db, p) for p in pos_rows])
             if not include_position_curves:
                 for p in positions:
                     p["price_curve_from_buy"] = []

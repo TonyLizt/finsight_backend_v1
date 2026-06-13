@@ -59,6 +59,29 @@ class RuntimePosition:
     latest_situation_score: float | None = None
     latest_signal: dict[str, Any] = field(default_factory=dict)
 
+@dataclass
+class RuntimeTickerTrack:
+    """股票池单只股票的全程展示状态。
+
+    RuntimePosition 只代表真实持仓；本对象代表前端动画需要展示的股票池状态。
+    因此前端即使在卖出后，也可以继续拿到该 ticker 后续每日价格、评分和交易标记。
+    """
+
+    ticker: str
+    price_curve: list[dict[str, Any]] = field(default_factory=list)
+    trade_markers: list[dict[str, Any]] = field(default_factory=list)
+    latest_score: float | None = None
+    latest_situation_score: float | None = None
+    latest_signal: dict[str, Any] = field(default_factory=dict)
+    latest_buy_date: date | None = None
+    latest_sell_date: date | None = None
+    sell_order: int | None = None
+    current_quantity: int = 0
+    cost_price: float | None = None
+    cost_amount: float | None = None
+    realized_pnl: float | None = None
+    realized_pnl_pct: float | None = None
+    holding_status: str = "watching"  # watching / holding / sold
 
 class BacktestLogWriter:
     """统一维护单次回测的 log_seq，保证日志顺序稳定。"""
@@ -155,24 +178,31 @@ def _current_price(row: PriceData | None) -> float | None:
 
 
 def _get_strategy_params(run: BacktestRun) -> dict[str, Any]:
-    """集中读取策略参数，并给旧数据补默认值。"""
+    """集中读取策略参数，并给旧数据补默认值。
+
+    用户当前只允许修改：
+    max_position_ratio、max_holding_count、fee_rate、take_profit_pct、stop_loss_pct。
+
+    其他策略参数统一由后端默认值控制。
+    """
     params = dict(run.strategy_params_json or {})
 
-    params.setdefault("forecast_days", 5)
-    params.setdefault("max_position_ratio", 0.3)
-    params.setdefault("max_holding_count", 3)
+    # 用户可配置参数。
+    params.setdefault("max_position_ratio", 0.2)
+    params.setdefault("max_holding_count", 5)
     params.setdefault("fee_rate", 0.0005)
-    params.setdefault("save_daily_positions", True)
-    params.setdefault("save_event_logs", True)
-    params.setdefault("animation_mode", "realtime")
-
-    # 以下是回测策略内部参数，前端不传也能稳定运行。
-    params.setdefault("buy_score_threshold", 54.0)
-    params.setdefault("buy_situation_threshold", 59.0)
-    params.setdefault("sell_score_threshold", 42.0)
     params.setdefault("take_profit_pct", 0.18)
     params.setdefault("stop_loss_pct", -0.08)
-    params.setdefault("min_cash_reserve_ratio", 0.02)
+
+    # 后端固定参数，不开放给用户修改。
+    params["forecast_days"] = 5
+    params["save_daily_positions"] = True
+    params["save_event_logs"] = True
+    params["animation_mode"] = "fast"
+    params["buy_score_threshold"] = 54.0
+    params["buy_situation_threshold"] = 59.0
+    params["sell_score_threshold"] = 42.0
+    params["min_cash_reserve_ratio"] = 0.02
 
     return params
 
@@ -192,20 +222,29 @@ def create_backtest_run(db: Session, user_id: int, req: BacktestRunRequest) -> B
 
     run = BacktestRun(
         user_id=user_id,
-        run_name=req.run_name or "Untitled Backtest",
+        run_name=f"回测 {req.start_date.isoformat()} 至 {req.end_date.isoformat()}",
         tickers_json=tickers,
         start_date=req.start_date,
         end_date=req.end_date,
         initial_cash=req.initial_cash,
-        benchmark=(req.benchmark or "SPY").upper() if req.benchmark else None,
+        benchmark="SPY",
         strategy_params_json={
-            "forecast_days": req.forecast_days,
+            # 用户可配置参数。
             "max_position_ratio": req.max_position_ratio,
             "max_holding_count": req.max_holding_count,
             "fee_rate": req.fee_rate,
-            "save_daily_positions": req.save_daily_positions,
-            "save_event_logs": req.save_event_logs,
-            "animation_mode": req.animation_mode,
+            "take_profit_pct": req.take_profit_pct,
+            "stop_loss_pct": req.stop_loss_pct,
+
+            # 后端固定参数，不开放给用户修改。
+            "forecast_days": 5,
+            "save_daily_positions": True,
+            "save_event_logs": True,
+            "animation_mode": "fast",
+            "buy_score_threshold": 54.0,
+            "buy_situation_threshold": 59.0,
+            "sell_score_threshold": 42.0,
+            "min_cash_reserve_ratio": 0.02,
         },
         status="pending",
         progress=0.0,
@@ -232,7 +271,6 @@ def create_backtest_run(db: Session, user_id: int, req: BacktestRunRequest) -> B
     db.commit()
 
     return run
-
 
 def execute_backtest_run(run_id: int) -> None:
     """后台执行入口。
@@ -354,6 +392,11 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
     initial_cash = float(run.initial_cash or 0)
     cash = initial_cash
     positions: dict[str, RuntimePosition] = {}
+    ticker_tracks: dict[str, RuntimeTickerTrack] = {
+        ticker: RuntimeTickerTrack(ticker=ticker)
+        for ticker in tickers
+    }
+    sell_sequence = 0
     daily_returns: list[float] = []
     total_values: list[float] = []
 
@@ -390,6 +433,26 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
                     ),
                     detail=signals[ticker],
                 )
+
+        # 更新股票池全程展示状态：无论是否持仓，都记录当日价格和评分。
+        for ticker in tickers:
+            track = ticker_tracks[ticker]
+            price = _current_price(day_prices.get(ticker))
+            signal = signals.get(ticker, {})
+            date_text = trading_day.isoformat()
+
+            if price is not None:
+                if not track.price_curve or track.price_curve[-1].get("date") != date_text:
+                    track.price_curve.append({"date": date_text, "close": _round_price(price)})
+
+            track.latest_score = signal.get("stock_score")
+            track.latest_situation_score = signal.get("situation_score")
+            track.latest_signal = {
+                **signal,
+                "action": "hold" if ticker in positions else track.holding_status,
+                "holding_status": track.holding_status,
+                "has_price_today": price is not None,
+            }
 
         # 先处理卖出，再处理买入。这样卖出释放的现金可用于当天新买入。
         for ticker in list(positions.keys()):
@@ -478,6 +541,39 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
                     },
                 )
 
+                sell_sequence += 1
+                track = ticker_tracks[ticker]
+                track.holding_status = "sold"
+                track.current_quantity = 0
+                track.latest_sell_date = trading_day
+                track.sell_order = sell_sequence
+                track.cost_price = position.cost_price
+                track.cost_amount = position.cost_amount
+                track.realized_pnl = realized_pnl
+                track.realized_pnl_pct = realized_pnl_pct
+                track.latest_signal = {
+                    **signal,
+                    "action": "sell",
+                    "side": "sell",
+                    "reason": sell_reason,
+                    "holding_status": "sold",
+                    "latest_buy_date": position.buy_date.isoformat() if position.buy_date else None,
+                    "latest_sell_date": trading_day.isoformat(),
+                    "sell_order": sell_sequence,
+                    "position_after": 0,
+                    "realized_pnl": _round_money(realized_pnl),
+                    "realized_pnl_pct": realized_pnl_pct,
+                }
+                track.trade_markers.append(
+                    {
+                        "date": trading_day.isoformat(),
+                        "side": "sell",
+                        "price": _round_price(price),
+                        "quantity": position.quantity,
+                        "reason": sell_reason,
+                        "sell_order": sell_sequence,
+                    }
+                )
                 del positions[ticker]
 
         marked_stock_value = _calculate_stock_value(positions, day_prices)
@@ -553,6 +649,37 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
                 latest_score=signal["stock_score"],
                 latest_situation_score=signal["situation_score"],
                 latest_signal={**signal, "action": "buy"},
+            )
+
+            track = ticker_tracks[ticker]
+            track.holding_status = "holding"
+            track.current_quantity = quantity
+            track.latest_buy_date = trading_day
+            track.latest_sell_date = None
+            track.sell_order = None
+            track.cost_price = cost_price
+            track.cost_amount = total_cost
+            track.realized_pnl = None
+            track.realized_pnl_pct = None
+            track.latest_score = signal["stock_score"]
+            track.latest_situation_score = signal["situation_score"]
+            track.latest_signal = {
+                **signal,
+                "action": "buy",
+                "side": "buy",
+                "reason": "股票评分和情况分达到买入阈值",
+                "holding_status": "holding",
+                "latest_buy_date": trading_day.isoformat(),
+                "position_after": quantity,
+            }
+            track.trade_markers.append(
+                {
+                    "date": trading_day.isoformat(),
+                    "side": "buy",
+                    "price": _round_price(price),
+                    "quantity": quantity,
+                    "reason": "股票评分和情况分达到买入阈值",
+                }
             )
 
             db.add(
@@ -666,6 +793,7 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
                 run=run,
                 trading_day=trading_day,
                 positions=positions,
+                ticker_tracks=ticker_tracks,
                 day_prices=day_prices,
                 total_value=total_value,
             )
@@ -1070,60 +1198,103 @@ def _calculate_stock_value(
 
     return total
 
-
 def _write_daily_positions(
     *,
     db: Session,
     run: BacktestRun,
     trading_day: date,
     positions: dict[str, RuntimePosition],
+    ticker_tracks: dict[str, RuntimeTickerTrack],
     day_prices: dict[str, PriceData],
     total_value: float,
 ) -> None:
-    for ticker, position in positions.items():
-        price = _current_price(day_prices.get(ticker))
+    """写入前端动画每日股票池状态。
 
-        if price is None and position.price_curve:
-            price = float(position.price_curve[-1]["close"])
+    旧逻辑只写仍在持仓的 positions，导致股票卖出后从 active_positions 消失。
+    新逻辑按 run.tickers_json 写入股票池所有 ticker：
+    1. 持仓中：quantity / stock_value / position_ratio 正常计算；
+    2. 已卖出：quantity=0、stock_value=0、position_ratio=0，但继续保留后续价格曲线；
+    3. 从未买入：quantity=0、stock_value=0、position_ratio=0，也返回 stock_score / situation_score。
+    """
+    tickers = _normalize_tickers(run.tickers_json or [])
 
-        if price is None:
-            continue
+    for ticker in tickers:
+        track = ticker_tracks.get(ticker) or RuntimeTickerTrack(ticker=ticker)
+        position = positions.get(ticker)
 
-        current_value = position.quantity * price
+        raw_price = _current_price(day_prices.get(ticker))
+        price = raw_price
+        has_price_today = raw_price is not None
+
+        # 某只股票当天缺行情时，用它最近一个有效收盘价兜底，保证前端列表字段稳定。
+        # price_curve 只记录真实有行情的交易日，不伪造缺失日价格点。
+        if price is None and track.price_curve:
+            price = float(track.price_curve[-1]["close"])
 
         previous_close = None
-        if len(position.price_curve) >= 2:
+        if position and len(position.price_curve) >= 2:
             previous_close = float(position.price_curve[-2]["close"])
+        elif len(track.price_curve) >= 2:
+            previous_close = float(track.price_curve[-2]["close"])
 
-        daily_pnl = (price - previous_close) * position.quantity if previous_close else 0.0
-        daily_pnl_pct = _safe_div(price - previous_close, previous_close) if previous_close else 0.0
-        total_pnl = current_value - position.cost_amount
-        total_pnl_pct = _safe_div(total_pnl, position.cost_amount) or 0.0
-        position_ratio = _safe_div(current_value, total_value) or 0.0
+        if position and price is not None:
+            quantity = position.quantity
+            current_value = quantity * price
+            cost_price = position.cost_price
+            cost_amount = position.cost_amount
+            buy_date = position.buy_date
+            daily_pnl = (price - previous_close) * quantity if previous_close else 0.0
+            daily_pnl_pct = _safe_div(price - previous_close, previous_close) if previous_close else 0.0
+            total_pnl = current_value - position.cost_amount
+            total_pnl_pct = _safe_div(total_pnl, position.cost_amount) or 0.0
+            position_ratio = _safe_div(current_value, total_value) or 0.0
+            holding_status = "holding"
+        else:
+            quantity = 0
+            current_value = 0.0
+            cost_price = track.cost_price
+            cost_amount = track.cost_amount
+            buy_date = track.latest_buy_date
+            daily_pnl = 0.0
+            daily_pnl_pct = 0.0
+            total_pnl = track.realized_pnl if track.realized_pnl is not None else 0.0
+            total_pnl_pct = track.realized_pnl_pct if track.realized_pnl_pct is not None else 0.0
+            position_ratio = 0.0
+            holding_status = track.holding_status
+
+        signal_json = {
+            **(track.latest_signal or {}),
+            "holding_status": holding_status,
+            "is_active_position": quantity > 0,
+            "latest_buy_date": buy_date.isoformat() if buy_date else None,
+            "latest_sell_date": track.latest_sell_date.isoformat() if track.latest_sell_date else None,
+            "sell_order": track.sell_order,
+            "trade_markers": track.trade_markers,
+            "has_price_today": has_price_today,
+        }
 
         db.add(
             BacktestDailyPosition(
                 run_id=run.id,
                 snapshot_date=trading_day,
                 ticker=ticker,
-                buy_date=position.buy_date,
-                quantity=position.quantity,
+                buy_date=buy_date,
+                quantity=quantity,
                 current_price=_round_price(price),
-                cost_price=_round_price(position.cost_price),
-                cost_amount=_round_money(position.cost_amount),
+                cost_price=_round_price(cost_price),
+                cost_amount=_round_money(cost_amount),
                 stock_value=_round_money(current_value),
                 daily_pnl=_round_money(daily_pnl),
                 daily_pnl_pct=daily_pnl_pct,
                 total_pnl=_round_money(total_pnl),
                 total_pnl_pct=total_pnl_pct,
                 position_ratio=position_ratio,
-                stock_score=position.latest_score,
-                situation_score=position.latest_situation_score,
-                price_curve_json=position.price_curve,
-                signal_json=position.latest_signal,
+                stock_score=track.latest_score,
+                situation_score=track.latest_situation_score,
+                price_curve_json=track.price_curve,
+                signal_json=signal_json,
             )
         )
-
 
 def _write_final_positions(
     *,
@@ -1262,17 +1433,33 @@ def snapshot_to_metrics(s: PortfolioSnapshot) -> dict:
         "benchmark_return": s.benchmark_return,
     }
 
+def _position_signal(p: BacktestDailyPosition) -> dict[str, Any]:
+    return dict(p.signal_json or {})
+
 
 def position_to_dict(db: Session, p: BacktestDailyPosition) -> dict:
     stock = db.query(Stock).filter(Stock.ticker == p.ticker).first()
+    signal = _position_signal(p)
+    trade_markers = signal.get("trade_markers") or []
+    holding_status = signal.get("holding_status") or ("holding" if (p.quantity or 0) > 0 else "watching")
+    is_active_position = bool(signal.get("is_active_position", (p.quantity or 0) > 0))
 
     return {
         "ticker": p.ticker,
         "company_name": stock.company_name if stock else None,
         "buy_date": p.buy_date.isoformat() if p.buy_date else None,
+        "latest_buy_date": signal.get("latest_buy_date") or (p.buy_date.isoformat() if p.buy_date else None),
+        "latest_sell_date": signal.get("latest_sell_date"),
+        "sell_order": signal.get("sell_order"),
+        "holding_status": holding_status,
+        "is_active_position": is_active_position,
         "price_curve_from_buy": p.price_curve_json or [],
+        "price_curve": p.price_curve_json or [],
+        "trade_markers": trade_markers,
         "stock_score": p.stock_score,
         "situation_score": p.situation_score,
+        "signal": signal,
+        "has_price_today": signal.get("has_price_today"),
         "stock_value": _safe_float(p.stock_value),
         "quantity": p.quantity,
         "quantitiy": p.quantity,  # 兼容旧前端拼写错误，推荐前端改用 quantity。
@@ -1284,14 +1471,41 @@ def position_to_dict(db: Session, p: BacktestDailyPosition) -> dict:
         "total_pnl": _safe_float(p.total_pnl),
         "total_pnl_pct": p.total_pnl_pct,
         "position_ratio": p.position_ratio,
+        "stock_value_pct": p.position_ratio,  # 前端可直接当“总股票价值百分比”使用。
         "postion_ration": p.position_ratio,  # 兼容旧前端拼写错误，推荐前端改用 position_ratio。
         "pnl_pct": p.total_pnl_pct,  # 兼容旧前端，推荐前端改用 total_pnl_pct。
     }
 
 
+def sort_position_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """前端展示顺序：持仓在上，0% 在下，已卖出按卖出先后放到底部。
+
+    规则：
+    1. position_ratio > 0 的真实持仓优先，比例越大越靠前；
+    2. 从未买入 / 观察中股票在中间，ticker 升序；
+    3. 已卖出股票放最后；若多个均为 0%，越早卖出的越靠后。
+    """
+    def key(item: dict[str, Any]) -> tuple:
+        ratio = float(item.get("position_ratio") or 0.0)
+        status = item.get("holding_status")
+        sell_order = item.get("sell_order")
+
+        if ratio > 0:
+            return (0, -ratio, item.get("ticker") or "")
+
+        if status == "sold":
+            # sell_order 越小代表越早卖出；用负号让越早卖出的排在更后面。
+            return (2, -(int(sell_order or 0)), item.get("ticker") or "")
+
+        return (1, item.get("ticker") or "")
+
+    return sorted(items, key=key)
+
+
 def trade_to_dict(t: BacktestTrade) -> dict:
     return {
         "trade_id": t.id,
+        "trade_date": t.trade_date.isoformat() if t.trade_date else None,
         "ticker": t.ticker,
         "side": t.side,
         "price": _safe_float(t.price),
@@ -1301,8 +1515,8 @@ def trade_to_dict(t: BacktestTrade) -> dict:
         "cash_after": _safe_float(t.cash_after),
         "position_after": t.position_after,
         "reason": t.reason,
+        "signal": t.signal_json or {},
     }
-
 
 def _normalize_trade_log_detail(log: BacktestEventLog) -> dict:
     detail = dict(log.detail_json or {})
@@ -1378,11 +1592,10 @@ def build_day_detail(db: Session, run: BacktestRun, target_date: date) -> dict:
         "run_id": run.id,
         "date": target_date.isoformat(),
         "metrics": snapshot_to_metrics(snapshot),
-        "active_positions": [position_to_dict(db, p) for p in positions],
+        "active_positions": sort_position_items([position_to_dict(db, p) for p in positions]),
         "trades": [trade_to_dict(t) for t in trades],
         "logs": [log_to_dict(l) for l in logs],
     }
-
 
 def final_positions(db: Session, run: BacktestRun) -> dict:
     snapshot = None
@@ -1407,17 +1620,11 @@ def final_positions(db: Session, run: BacktestRun) -> dict:
 
     final_date = run.final_snapshot_date or (snapshot.snapshot_date if snapshot else None)
 
-    positions = (
-        db.query(UserSimulatedPosition)
-        .filter(UserSimulatedPosition.source_run_id == run.id)
-        .order_by(UserSimulatedPosition.ticker.asc())
-        .all()
-    )
-
-    # 如果最终持仓表还没写入，则从最后一天持仓快照兜底返回。
-    fallback_positions = []
-    if not positions and final_date:
-        fallback_positions = (
+    # 新逻辑优先使用最终日 backtest_daily_positions。
+    # 因为该表现在包含股票池所有 ticker，而 user_simulated_positions 只保存最终真实持仓。
+    final_daily_positions = []
+    if final_date:
+        final_daily_positions = (
             db.query(BacktestDailyPosition)
             .filter(
                 BacktestDailyPosition.run_id == run.id,
@@ -1427,10 +1634,19 @@ def final_positions(db: Session, run: BacktestRun) -> dict:
             .all()
         )
 
-    if not snapshot and not positions and not fallback_positions:
-        raise AppException(BACKTEST_FINAL_POSITION_NOT_FOUND, "回测最终持仓不存在或尚未生成。", 404)
+    if final_daily_positions:
+        position_items = sort_position_items([position_to_dict(db, p) for p in final_daily_positions])
+    else:
+        positions = (
+            db.query(UserSimulatedPosition)
+            .filter(UserSimulatedPosition.source_run_id == run.id)
+            .order_by(UserSimulatedPosition.ticker.asc())
+            .all()
+        )
 
-    if positions:
+        if not snapshot and not positions:
+            raise AppException(BACKTEST_FINAL_POSITION_NOT_FOUND, "回测最终持仓不存在或尚未生成。", 404)
+
         position_items = [
             {
                 "ticker": p.ticker,
@@ -1445,13 +1661,16 @@ def final_positions(db: Session, run: BacktestRun) -> dict:
                 "total_pnl_pct": p.total_pnl_pct,
                 "pnl_pct": p.total_pnl_pct,
                 "position_ratio": p.position_ratio,
+                "stock_value_pct": p.position_ratio,
                 "postion_ration": p.position_ratio,
+                "holding_status": "holding" if (p.quantity or 0) > 0 else "watching",
+                "is_active_position": (p.quantity or 0) > 0,
                 "price_curve_from_buy": p.price_curve_json or [],
+                "price_curve": p.price_curve_json or [],
+                "trade_markers": [],
             }
             for p in positions
         ]
-    else:
-        position_items = [position_to_dict(db, p) for p in fallback_positions]
 
     return {
         "run_id": run.id,
