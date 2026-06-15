@@ -7,8 +7,8 @@
 4. 写入 portfolio_snapshots / backtest_daily_positions / backtest_trades / backtest_event_logs；
 5. 完成后写入 user_simulated_positions，并更新 backtest_runs 最终汇总。
 
-当前策略是数据库驱动的规则策略，避免在回测中调用耗时模型接口。
-后续如果要接入真实模型，只需要替换 _build_signal() 的评分逻辑即可，接口和落表结构不需要改。
+当前策略优先使用服务器 active 模型生成每日信号；当某只股票某一天特征缺失时，
+才降级使用数据库驱动的规则信号，避免单点数据缺失中断整段回测。
 """
 
 from __future__ import annotations
@@ -43,6 +43,13 @@ from app.models.all_models import (
     UserSimulatedPosition,
 )
 from app.schemas.backtest import BacktestRunRequest
+from app.services.feature_service import build_feature_dict, validate_feature_columns
+from app.services.model_service import (
+    load_active_model,
+    predict_aux_classifier,
+    predict_classifier,
+    predict_regressor,
+)
 
 
 @dataclass
@@ -82,6 +89,17 @@ class RuntimeTickerTrack:
     realized_pnl: float | None = None
     realized_pnl_pct: float | None = None
     holding_status: str = "watching"  # watching / holding / sold
+
+@dataclass
+class RuntimeBacktestModelBundle:
+    """单次回测复用的模型对象，避免每天、每只股票重复查库和加载 joblib。"""
+
+    classifier_model: Any
+    classifier_match_status: str
+    reg_model: Any
+    reg_match_status: str
+    aux_model: Any | None = None
+    aux_match_status: str | None = None
 
 class BacktestLogWriter:
     """统一维护单次回测的 log_seq，保证日志顺序稳定。"""
@@ -195,14 +213,14 @@ def _get_strategy_params(run: BacktestRun) -> dict[str, Any]:
     params.setdefault("stop_loss_pct", -0.08)
 
     # 后端固定参数，不开放给用户修改。
-    params["forecast_days"] = 5
-    params["save_daily_positions"] = True
-    params["save_event_logs"] = True
-    params["animation_mode"] = "fast"
-    params["buy_score_threshold"] = 54.0
-    params["buy_situation_threshold"] = 59.0
-    params["sell_score_threshold"] = 42.0
-    params["min_cash_reserve_ratio"] = 0.02
+    params.setdefault("forecast_days", 5)
+    params.setdefault("save_daily_positions", True)
+    params.setdefault("save_event_logs", True)
+    params.setdefault("animation_mode", "fast")
+    params.setdefault("buy_score_threshold", 54.0)
+    params.setdefault("buy_situation_threshold", 59.0)
+    params.setdefault("sell_score_threshold", 42.0)
+    params.setdefault("min_cash_reserve_ratio", 0.02)
 
     return params
 
@@ -389,6 +407,64 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
     )
     db.commit()
 
+    forecast_days = int(params.get("forecast_days") or 5)
+
+    try:
+        classifier_model, classifier_match_status = load_active_model(db, "classifier", forecast_days)
+        reg_model, reg_match_status = load_active_model(db, "regressor", forecast_days)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"回测无法启动：active 分类/回归模型加载失败：{exc}") from exc
+
+    if classifier_model.feature_columns != reg_model.feature_columns:
+        raise RuntimeError("回测无法启动：分类模型与回归模型的 feature_columns 不一致。")
+
+    aux_model = None
+    aux_match_status = None
+    try:
+        aux_model, aux_match_status = load_active_model(db, "aux_classifier", 10)
+    except Exception as exc:  # noqa: BLE001
+        logger.write(
+            level="warning",
+            event_type="model",
+            action="skip_aux_model",
+            message=f"辅助强信号模型加载失败，回测继续使用主分类/回归模型：{exc}",
+            detail={"error": str(exc)},
+            force=True,
+        )
+
+    model_bundle = RuntimeBacktestModelBundle(
+        classifier_model=classifier_model,
+        classifier_match_status=classifier_match_status,
+        reg_model=reg_model,
+        reg_match_status=reg_match_status,
+        aux_model=aux_model,
+        aux_match_status=aux_match_status,
+    )
+
+    logger.write(
+        event_type="model",
+        action="load_active_model",
+        message=(
+            "回测已接入 active 模型推理："
+            f"classifier={classifier_model.version.version_name}({classifier_match_status})，"
+            f"regressor={reg_model.version.version_name}({reg_match_status})。"
+        ),
+        detail={
+            "forecast_days": forecast_days,
+            "classifier_model_id": classifier_model.version.id,
+            "classifier_model_version": classifier_model.version.version_name,
+            "classifier_match_status": classifier_match_status,
+            "reg_model_id": reg_model.version.id,
+            "reg_model_version": reg_model.version.version_name,
+            "reg_match_status": reg_match_status,
+            "aux_model_id": aux_model.version.id if aux_model else None,
+            "aux_model_version": aux_model.version.version_name if aux_model else None,
+            "aux_match_status": aux_match_status,
+        },
+        force=True,
+    )
+    db.commit()
+
     initial_cash = float(run.initial_cash or 0)
     cash = initial_cash
     positions: dict[str, RuntimePosition] = {}
@@ -416,9 +492,14 @@ def _execute_backtest_run_in_session(db: Session, run_id: int) -> None:
 
         for ticker in tickers:
             signals[ticker] = _build_signal(
+                db=db,
+                ticker=ticker,
+                trading_day=trading_day,
                 price_row=day_prices.get(ticker),
                 indicator=indicator_map.get((ticker, trading_day)),
                 sentiment=sentiment_map.get((ticker, trading_day)),
+                model_bundle=model_bundle,
+                forecast_days=forecast_days,
             )
 
             if verbose_logs and ticker in day_prices:
@@ -1053,16 +1134,209 @@ def _benchmark_metrics(
 
     return benchmark_value, benchmark_return
 
-
 def _build_signal(
+    *,
+    db: Session,
+    ticker: str,
+    trading_day: date,
+    price_row: PriceData | None,
+    indicator: TechnicalIndicator | None,
+    sentiment: SentimentDaily | None,
+    model_bundle: RuntimeBacktestModelBundle,
+    forecast_days: int,
+) -> dict[str, Any]:
+    """生成单日交易信号。
+
+    优先调用 active classifier / regressor 真实模型；如果某只股票某一天特征缺失，
+    则降级到旧规则信号，保证回测动画不中断。主模型加载失败会在回测启动阶段直接失败。
+    """
+    try:
+        return _build_model_signal(
+            db=db,
+            ticker=ticker,
+            trading_day=trading_day,
+            price_row=price_row,
+            sentiment=sentiment,
+            model_bundle=model_bundle,
+            forecast_days=forecast_days,
+        )
+    except Exception as exc:  # noqa: BLE001
+        signal = _build_rule_signal(price_row=price_row, indicator=indicator, sentiment=sentiment)
+        signal["signal_source"] = "rule_fallback"
+        signal["model_signal_available"] = False
+        signal["model_error"] = str(exc)
+        signal.setdefault("reasons", []).append(f"模型信号生成失败，已降级规则信号：{exc}")
+        return signal
+
+
+def _build_model_signal(
+    *,
+    db: Session,
+    ticker: str,
+    trading_day: date,
+    price_row: PriceData | None,
+    sentiment: SentimentDaily | None,
+    model_bundle: RuntimeBacktestModelBundle,
+    forecast_days: int,
+) -> dict[str, Any]:
+    """使用与 PredictionService 相同的模型推理链路生成回测信号。"""
+    feature_result = build_feature_dict(db, ticker, base_trading_date=trading_day)
+    feature_dict = feature_result["feature_dict"]
+
+    validate_feature_columns(feature_dict, model_bundle.classifier_model.feature_columns)
+    validate_feature_columns(feature_dict, model_bundle.reg_model.feature_columns)
+
+    classification = predict_classifier(model_bundle.classifier_model, feature_dict)
+    predicted_returns = predict_regressor(model_bundle.reg_model, feature_dict)[:forecast_days]
+
+    predicted_label = classification["predicted_label"]
+    prob_up = float(classification["prob_up"])
+    prob_neutral = float(classification["prob_neutral"])
+    prob_down = float(classification["prob_down"])
+
+    close = _current_price(price_row)
+    previous_close = _safe_float(price_row.previous_close) if price_row else None
+
+    daily_return = None
+    if price_row and price_row.daily_return is not None:
+        daily_return = float(price_row.daily_return)
+    elif close is not None and previous_close:
+        daily_return = close / previous_close - 1
+
+    volatility = float(feature_dict.get("volatility_20d", 0.0) or 0.0)
+    sentiment_score = float(feature_dict.get("sentiment_score", 0.0) or 0.0)
+    news_count = int(float(feature_dict.get("news_count", 0.0) or 0.0))
+
+    if predicted_returns:
+        max_upside = max(0.0, max(float(x) for x in predicted_returns))
+        max_downside = max(0.0, -min(float(x) for x in predicted_returns))
+        avg_predicted_return = mean(float(x) for x in predicted_returns)
+    else:
+        max_upside = 0.0
+        max_downside = 0.0
+        avg_predicted_return = 0.0
+
+    aux_signal = None
+    strong_signal_score = None
+
+    if model_bundle.aux_model is not None:
+        try:
+            validate_feature_columns(feature_dict, model_bundle.aux_model.feature_columns)
+            aux_signal = predict_aux_classifier(model_bundle.aux_model, feature_dict)
+            strong_signal_score = float(aux_signal.get("strong_signal_score"))
+        except Exception:  # noqa: BLE001
+            aux_signal = None
+            strong_signal_score = None
+
+    # stock_score 对齐 PredictionService 的 recommendation_score 思路：
+    # 分类概率 + 回归上/下行空间 + 新闻情绪 + 波动风险 + 辅助强信号。
+    stock_score = (
+        50
+        + (prob_up - prob_down) * 40
+        + max_upside * 300
+        - max_downside * 200
+        + sentiment_score * 10
+        - volatility * 100
+    )
+
+    if strong_signal_score is not None:
+        stock_score += (strong_signal_score - 0.5) * 20
+
+    # situation_score 更偏“市场/风险环境”：保留与原买入阈值 59 的尺度兼容。
+    situation_score = (
+        50
+        + (prob_up - prob_down) * 30
+        + avg_predicted_return * 450
+        - max_downside * 220
+        + sentiment_score * 15
+        - volatility * 120
+    )
+
+    if predicted_label == "up":
+        situation_score += 4
+    elif predicted_label == "down":
+        situation_score -= 4
+
+    if strong_signal_score is not None:
+        situation_score += (strong_signal_score - 0.5) * 10
+
+    stock_score = _clamp(stock_score, 0, 100)
+    situation_score = _clamp(situation_score, 0, 100)
+    predicted_growth_prob = prob_up
+
+    if stock_score >= 54 and situation_score >= 59:
+        action_hint = "buy"
+    elif stock_score <= 42 or situation_score <= 35 or predicted_label == "down":
+        action_hint = "sell"
+    else:
+        action_hint = "hold"
+
+    model_match_status = model_bundle.classifier_match_status
+    if model_bundle.classifier_match_status != model_bundle.reg_match_status:
+        model_match_status = (
+            "nearest_active_model"
+            if "nearest_active_model"
+            in {model_bundle.classifier_match_status, model_bundle.reg_match_status}
+            else model_bundle.classifier_match_status
+        )
+
+    reasons = [
+        f"模型预测方向 {predicted_label}",
+        f"上涨概率 {prob_up:.1%}，震荡概率 {prob_neutral:.1%}，下跌概率 {prob_down:.1%}",
+        f"未来 {forecast_days} 日最大上行 {max_upside:.2%}，最大下行 {max_downside:.2%}",
+        f"新闻情绪分 {sentiment_score:.2f}",
+    ]
+
+    if strong_signal_score is not None:
+        reasons.append(f"辅助强信号模型得分 {strong_signal_score:.3f}")
+
+    return {
+        # 保持原有信号字段，前端接口结构不用改。
+        "stock_score": round(stock_score, 4),
+        "situation_score": round(situation_score, 4),
+        "predicted_growth_prob": round(predicted_growth_prob, 4),
+        "action_hint": action_hint,
+        "close": _round_price(close),
+        "daily_return": daily_return,
+        "sentiment_score": (
+            float(sentiment.sentiment_score)
+            if sentiment and sentiment.sentiment_score is not None
+            else sentiment_score
+        ),
+        "news_count": sentiment.news_count if sentiment else news_count,
+        "reasons": reasons,
+
+        # 这些字段只进入 signal_json，frames/status/summary 的顶层结构不变。
+        "signal_source": "model",
+        "model_signal_available": True,
+        "feature_source": feature_result.get("feature_source"),
+        "feature_base_trading_date": (
+            feature_result.get("base_trading_date").isoformat()
+            if feature_result.get("base_trading_date")
+            else None
+        ),
+        "predicted_label": predicted_label,
+        "prob_up": round(prob_up, 6),
+        "prob_neutral": round(prob_neutral, 6),
+        "prob_down": round(prob_down, 6),
+        "predicted_returns": [round(float(x), 6) for x in predicted_returns],
+        "avg_predicted_return": round(avg_predicted_return, 6),
+        "max_predicted_upside_pct": round(max_upside, 6),
+        "max_predicted_downside_pct": round(max_downside, 6),
+        "volatility_20d": round(volatility, 6),
+        "classifier_model_version": model_bundle.classifier_model.version.version_name,
+        "reg_model_version": model_bundle.reg_model.version.version_name,
+        "model_match_status": model_match_status,
+        "aux_model": aux_signal,
+    }
+
+
+def _build_rule_signal(
     price_row: PriceData | None,
     indicator: TechnicalIndicator | None,
     sentiment: SentimentDaily | None,
 ) -> dict[str, Any]:
-    """生成单日交易信号。
-
-    本函数只使用当前交易日及以前已经落库的数据，避免未来函数。
-    """
+    """旧版规则信号，只作为单日模型特征缺失时的降级方案。"""
     close = _current_price(price_row)
     previous_close = _safe_float(price_row.previous_close) if price_row else None
 
@@ -1134,7 +1408,7 @@ def _build_signal(
     stock_score = _clamp(stock_score, 0, 100)
     situation_score = _clamp(situation_score, 0, 100)
     predicted_growth_prob = stock_score / 100
-    
+
     if stock_score >= 54 and situation_score >= 59:
         action_hint = "buy"
     elif stock_score <= 42 or situation_score <= 35:
@@ -1149,11 +1423,16 @@ def _build_signal(
         "action_hint": action_hint,
         "close": _round_price(close),
         "daily_return": daily_return,
-        "sentiment_score": float(sentiment.sentiment_score) if sentiment and sentiment.sentiment_score is not None else None,
+        "sentiment_score": (
+            float(sentiment.sentiment_score)
+            if sentiment and sentiment.sentiment_score is not None
+            else None
+        ),
         "news_count": sentiment.news_count if sentiment else None,
         "reasons": reasons,
+        "signal_source": "rule",
+        "model_signal_available": False,
     }
-
 
 def _should_sell(
     position: RuntimePosition,

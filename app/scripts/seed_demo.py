@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
-from app.core.security import get_password_hash
+from app.core.security import build_client_password_sha256_for_seed, get_password_hash
 from app.models.all_models import (
     Role,
     User,
@@ -37,13 +37,33 @@ def get_role(db, name: str):
 
 def upsert_user(db, username: str, password: str, role_name: str):
     role = get_role(db, role_name)
+
+    password_sha256 = build_client_password_sha256_for_seed(password)
+    password_hash = get_password_hash(password_sha256)
+
     u = db.query(User).filter(User.username == username).first()
+
     if not u:
-        u = User(username=username, password_hash=get_password_hash(password), role_id=role.id, status="active")
+        u = User(
+            username=username,
+            password_hash=password_hash,
+            role_id=role.id,
+            status="active",
+        )
         db.add(u)
         db.commit()
-    return u
+        return u
 
+    # demo 账号每次 seed 时同步升级到新登录模型。
+    # 真实生产环境不要自动重置用户密码。
+    if username in {"admin", "user01"}:
+        u.password_hash = password_hash
+        u.role_id = role.id
+        if u.status == "deleted":
+            u.status = "active"
+        db.commit()
+
+    return u
 
 def main():
     init_db()

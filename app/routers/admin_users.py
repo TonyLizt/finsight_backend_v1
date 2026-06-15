@@ -122,13 +122,41 @@ def update_username(user_id: int, req: UpdateUsernameRequest, db: Session = Depe
     write_operation_log(db, admin.id, "AdminUserService", "update_username", "success", f"user_id={user_id}, old={old}, new={req.username}, reason={req.reason}")
     return ok({"user_id": target.id, "old_username": old, "new_username": target.username, "updated_at": datetime.utcnow().isoformat()}, "username updated")
 
-
 @router.put("/{user_id}/password")
-def reset_user_password(user_id: int, req: ResetPasswordRequest, db: Session = Depends(get_db), admin: User = Depends(get_current_admin)):
+def reset_user_password(
+    user_id: int,
+    req: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
     target = get_user_or_404(db, user_id)
-    reset_password(db, target, req.new_password, req.confirm_password)
-    write_operation_log(db, admin.id, "AdminUserService", "reset_password", "success", f"user_id={user_id}, force_logout={req.force_logout}, reason={req.reason}")
-    return ok({"user_id": target.id, "username": target.username, "password_updated": True, "force_logout": req.force_logout, "updated_at": datetime.utcnow().isoformat()}, "user password reset")
+
+    reset_password(
+        db,
+        target,
+        req.new_password_sha256,
+        req.confirm_password_sha256,
+    )
+
+    write_operation_log(
+        db,
+        admin.id,
+        "AdminUserService",
+        "reset_password",
+        "success",
+        f"user_id={user_id}, force_logout={req.force_logout}, reason={req.reason}",
+    )
+
+    return ok(
+        {
+            "user_id": target.id,
+            "username": target.username,
+            "password_updated": True,
+            "force_logout": req.force_logout,
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+        "user password reset",
+    )
 
 
 @router.delete("/{user_id}")
