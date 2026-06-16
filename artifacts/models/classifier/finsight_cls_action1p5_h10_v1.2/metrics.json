@@ -1,0 +1,35 @@
+{
+  "note": "train_metrics are fitted-sample diagnostics only; use rolling_validation_metrics for model selection.",
+  "train_metrics": {
+    "accuracy": 0.5692803030303031,
+    "macro_f1": 0.5638975456752153,
+    "precision": 0.5133689839572193,
+    "recall": 0.5175423583775458,
+    "confusion_matrix": [
+      [
+        8981,
+        5733
+      ],
+      [
+        5638,
+        6048
+      ]
+    ],
+    "positive_rate_true": 0.44265151515151513,
+    "positive_rate_pred": 0.44625
+  },
+  "rolling_validation_metrics": {
+    "candidate": "action1p5_h10_market_ext_ridge",
+    "task": "action_1p5",
+    "horizon": 10,
+    "feature_set": "f0_market_ext",
+    "model": "ridge",
+    "folds": 3,
+    "mean_test_accuracy": 0.6120311590744109,
+    "mean_test_macro_f1": 0.5731920451008653,
+    "mean_above_baseline": 0.0615443477781301,
+    "min_above_baseline": 0.0035985605757696,
+    "mean_hc_test_coverage": 0.5273188480491766,
+    "mean_hc_test_accuracy": 0.6472772018009023
+  }
+}

@@ -16,12 +16,14 @@ class UpdateUsernameRequest(BaseModel):
     reason: str | None = None
 
 
+SHA256_HEX_PATTERN = r"^[0-9a-fA-F]{64}$"
+
+
 class ResetPasswordRequest(BaseModel):
-    new_password: str = Field(min_length=6)
-    confirm_password: str = Field(min_length=6)
+    new_password_sha256: str = Field(min_length=64, max_length=64, pattern=SHA256_HEX_PATTERN)
+    confirm_password_sha256: str = Field(min_length=64, max_length=64, pattern=SHA256_HEX_PATTERN)
     force_logout: bool = True
     reason: str | None = None
-
 
 class DeleteUserRequest(BaseModel):
     reason: str | None = None

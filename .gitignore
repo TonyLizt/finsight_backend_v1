@@ -28,6 +28,16 @@ ENV/
 *.env/
 
 # =========================
+# Local data / experiment outputs
+# =========================
+noapp/
+data/
+outputs/
+local_experiments/
+external_data/
+import_data/
+
+# =========================
 # Environment files
 # =========================
 .env
@@ -83,19 +93,45 @@ temp/
 .cache/
 
 # =========================
-# Model files / large artifacts
-# 如果以后有模型文件，建议不要直接上传 Git
+# Database backups
 # =========================
+backups/
+backup_before_real_data.sql
+*backup*.sql
+*dump*.sql
+*.sql.gz
+*.sql.zip
+
+# =========================
+# Model / artifacts
+# 当前项目允许提交 artifacts/models 下的小模型文件
+# 但不提交其他 artifacts 输出
+# =========================
+artifacts/*
+!artifacts/models/
+!artifacts/models/**
+
 models_artifacts/
-artifacts/
 *.pkl
-*.joblib
 *.pt
 *.pth
 *.onnx
 *.bin
 
+# 允许 artifacts/models 下的 joblib 模型提交
+*.joblib
+!artifacts/models/**/*.joblib
+
 # =========================
 # Jupyter
 # =========================
 .ipynb_checkpoints/
+
+# =========================
+# Local backup files
+# =========================
+*.bak
+*.bak_*
+*.py.bak
+*.py.bak_*
+*.bak_fix_*

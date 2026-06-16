@@ -6,6 +6,8 @@
 from datetime import datetime
 import csv
 import io
+import os
+from pathlib import Path
 import requests
 from sqlalchemy.orm import Session
 
@@ -13,6 +15,25 @@ from app.models.all_models import Stock, StockUniverseSyncLog, CrawlerLog
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+
+LOCAL_STOCK_UNIVERSE_DIR = Path(
+    os.getenv("FINSIGHT_STOCK_UNIVERSE_RAW_DIR", "/data/hmt/datasets/finsight/stock_universe/raw")
+)
+
+
+def _load_stock_universe_text(source_name: str, url: str) -> str:
+    """优先读取本地 Nasdaq Trader 文件；本地不存在时再尝试网络下载。"""
+    filename_map = {
+        "nasdaqlisted": "nasdaqlisted.txt",
+        "otherlisted": "otherlisted.txt",
+    }
+    local_path = LOCAL_STOCK_UNIVERSE_DIR / filename_map[source_name]
+    if local_path.exists() and local_path.stat().st_size > 0:
+        return local_path.read_text(encoding="utf-8", errors="ignore")
+
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    return resp.text
 
 
 def _yn(value: str | None) -> bool:
@@ -39,9 +60,7 @@ def sync_stock_universe(db: Session) -> dict:
     for source_name, url in [("nasdaqlisted", NASDAQ_LISTED_URL), ("otherlisted", OTHER_LISTED_URL)]:
         src_started = datetime.utcnow()
         try:
-            resp = requests.get(url, timeout=20)
-            resp.raise_for_status()
-            text = resp.text
+            text = _load_stock_universe_text(source_name, url)
             rows = [line for line in text.splitlines() if line and not line.startswith("File Creation Time")]
             reader = csv.DictReader(io.StringIO("\n".join(rows)), delimiter="|")
             fetched = inserted_one = updated_one = 0

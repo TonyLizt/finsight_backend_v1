@@ -1,6 +1,6 @@
 # Finsight FastAPI backend Docker image
 # 使用 Python 3.10，和本项目推荐的 conda 环境版本一致。
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # 避免生成 .pyc，并让日志实时输出到终端。
 ENV PYTHONDONTWRITEBYTECODE=1 \

@@ -38,6 +38,8 @@ services:
       - "8002:8000"
     volumes:
       - .:/app
+      - /data/hmt/projects/finsight/finsight_backend_v1_git/local_experiments/outputs:/external_outputs:ro
+      - /data/hmt/datasets/finsight:/external_datasets:ro
 
 volumes:
   mysql_data:

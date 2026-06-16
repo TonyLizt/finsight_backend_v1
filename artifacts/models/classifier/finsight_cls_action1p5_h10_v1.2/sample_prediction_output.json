@@ -1,0 +1,8 @@
+{
+  "candidate": "action1p5_h10_market_ext_ridge",
+  "prediction_class": 0,
+  "prediction_score": 0.46799179410893404,
+  "recommendation_score": 0.46799179410893404,
+  "recommendation_level": "neutral",
+  "note": "This is a sample output for backend integration format validation."
+}

@@ -10,3 +10,13 @@ python-jose[cryptography]==3.3.0
 python-multipart==0.0.19
 requests==2.32.3
 
+
+# Model loading and Member B v1.2 model delivery
+numpy
+pandas
+scikit-learn==1.8.0
+joblib
+xgboost
+pyarrow
+akshare>=1.18.0
+matplotlib

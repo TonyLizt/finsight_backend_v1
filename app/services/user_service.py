@@ -75,12 +75,20 @@ def update_user_role(db: Session, target: User, new_role_name: str) -> User:
     return target
 
 
-def reset_password(db: Session, target: User, new_password: str, confirm_password: str) -> User:
-    if new_password != confirm_password:
+def reset_password(
+    db: Session,
+    target: User,
+    new_password_sha256: str,
+    confirm_password_sha256: str,
+) -> User:
+    if new_password_sha256.lower() != confirm_password_sha256.lower():
         raise AppException(PASSWORD_NOT_MATCH, "两次输入的密码不一致。", 400)
-    if not is_valid_password_format(new_password):
-        raise AppException("INVALID_PASSWORD_FORMAT", "密码格式不符合要求。", 400)
-    target.password_hash = get_password_hash(new_password)
+
+    if not is_valid_password_format(new_password_sha256):
+        raise AppException("INVALID_PASSWORD_FORMAT", "密码摘要格式不符合要求。", 400)
+
+    target.password_hash = get_password_hash(new_password_sha256)
+
     db.commit()
     db.refresh(target)
     return target

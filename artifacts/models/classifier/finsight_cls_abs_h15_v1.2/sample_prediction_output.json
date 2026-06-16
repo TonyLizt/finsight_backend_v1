@@ -1,0 +1,8 @@
+{
+  "candidate": "abs_h15_market_ext_logreg",
+  "prediction_class": 0,
+  "prediction_score": 0.44331355396245686,
+  "recommendation_score": 0.44331355396245686,
+  "recommendation_level": "negative",
+  "note": "This is a sample output for backend integration format validation."
+}
