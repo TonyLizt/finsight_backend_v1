@@ -1,1217 +1,730 @@
-# Finsight Backend
+# Finsight Backend v1.5
 
-**Finsight / 智融洞察：面向股票趋势预测与模拟回测的金融分析系统**
+> **智融洞察：面向股票趋势预测与模拟回测的金融分析系统**  
+> 一个集成股票行情、新闻情绪、机器学习预测、LLM 解释报告与模拟回测的 AI for Finance 项目后端。
 
-本仓库是 Finsight 项目的后端部分，采用 **FastAPI + MySQL + Docker Compose** 架构，面向股票行情查询、新闻情绪分析、模型预测、预测历史、数据补全、日志管理和模拟回测等功能。
+Finsight Backend 是 Finsight 项目的后端服务，基于 **FastAPI + MySQL + Docker Compose** 构建，向前端客户端提供统一的 HTTP/JSON API。系统支持用户登录、自选股管理、股票行情查询、新闻情绪分析、模型预测、中文解释报告、模拟回测、日志查询和管理员用户管理。
 
-当前版本建议定位为：
-
-> **Finsight Backend v1.5：FastAPI + MySQL + Docker + v1.2 三模型推理 + 百炼 LLM 报告 + Twelve Data 自爬行情 + 1min 分钟行情 + Alpha Vantage 新闻情绪 + 新闻正文抓取 + 52 维运行时特征快照 + 数据库优先补全 + 按需预测数据准备。**
-
----
-
-## 1. 当前版本状态
-
-### 1.1 已完成能力
-
-- FastAPI 后端主框架
-- MySQL 8.0 数据库连接与 ORM 表结构
-- Docker Compose 一键启动后端和数据库
-- JWT 登录鉴权
-- 用户注册、登录、当前用户信息
-- 管理员用户管理
-- 股票基础库同步与搜索
-- 用户自选股增删查
-- 股票详情查询
-- 股票新闻列表查询
-- 股票新闻详情查询
-- 新闻原文正文抓取与缓存
-- 14 日新闻情绪统计
-- 日频行情数据补全
-- 1min 分钟行情数据补全
-- 技术指标重算
-- 新闻情绪日聚合
-- 运行时模型特征快照生成
-- 单股预测接口
-- 预测历史列表
-- 预测详情接口
-- 当前启用模型查询
-- 兼容式每日数据补全入口
-- 统一 Data Pipeline 任务入口
-- API 自动化测试脚本
-- 数据库检查与修复脚本
-- 百炼 / DashScope LLM 综合报告接入
-- 模型预测结果保存到 `predictions`
-- 多次预测不会覆盖旧记录，每次预测都会生成独立 `prediction_id`
+本项目面向课程实践、金融数据分析原型和 AI for Finance 演示场景。系统中的预测结果、推荐分数、新闻情绪和回测收益仅用于学习、实验和展示，**不构成任何真实投资建议**。
 
 ---
 
-### 1.2 当前核心数据源
+## 目录
 
-| 数据类别       | 当前来源                           | 说明                           |
-| -------------- | ---------------------------------- | ------------------------------ |
-| 股票基础库     | Nasdaq Trader                      | 写入 `stocks`                  |
-| 日频行情       | Twelve Data `time_series` `1day`   | 写入 `price_data`              |
-| 分钟行情       | Twelve Data `time_series` `1min`   | 写入 `intraday_price_data`     |
-| 新闻列表与情绪 | Alpha Vantage News Sentiment       | 写入 `news_data`               |
-| 新闻正文       | 新闻原文 URL 抓取                  | 写入 `news_data.content_text`  |
-| 新闻日聚合     | 后端从 `news_data` 聚合            | 写入 `sentiment_daily`         |
-| 技术指标       | 后端从 `price_data` 计算           | 写入 `technical_indicators`    |
-| 模型特征快照   | 后端融合行情、技术指标、新闻、财报 | 写入 `model_feature_snapshots` |
-| LLM 分析报告   | 阿里云百炼 / DashScope             | 写入预测解释字段               |
+- [项目简介](#项目简介)
+- [项目特色](#项目特色)
+- [系统能做什么](#系统能做什么)
+- [使用流程](#使用流程)
+- [技术架构](#技术架构)
+- [当前版本](#当前版本)
+- [环境要求](#环境要求)
+- [快速启动](#快速启动)
+- [环境变量说明](#环境变量说明)
+- [数据库初始化](#数据库初始化)
+- [主要 API 模块](#主要-api-模块)
+- [模型预测说明](#模型预测说明)
+- [模拟回测说明](#模拟回测说明)
+- [数据流水线与爬虫](#数据流水线与爬虫)
+- [自动化测试](#自动化测试)
+- [项目目录结构](#项目目录结构)
+- [常见问题](#常见问题)
+- [安全与免责声明](#安全与免责声明)
 
 ---
 
-### 1.3 当前已验证数据状态
+## 项目简介
 
-当前开发环境中已经验证核心 7 只股票：
+普通用户在分析股票时，往往需要同时查看多个维度的信息：
+
+- 股票当前价格与历史走势；
+- 技术指标，例如均线、RSI、MACD；
+- 公司相关新闻；
+- 新闻情绪倾向；
+- 模型对未来趋势的判断；
+- 如果按某套策略交易，历史上收益如何。
+
+Finsight 的目标是把这些信息整合到同一个系统中。用户可以在前端选择股票、查看行情新闻、发起预测，并通过模拟回测观察模型信号在历史区间内的表现。后端负责数据存储、数据补齐、模型推理、LLM 报告生成和回测计算。
+
+整体架构如下：
 
 ```text
-AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META
-```
-
-已验证结果：
-
-```text
-price_data:
-7 只股票全部 860 行
-2023-01-03 ~ 2026-06-08
-
-price_data 派生字段:
-recent 30 rows bad count = 0
-previous_close / change_amount / change_percent / daily_return / amplitude 正常
-
-intraday_price_data:
-7 只股票全部为 2026-06-08
-每只股票 390 条 1min 数据
-时间范围 09:30:00 ~ 15:59:00
-
-technical_indicators:
-7 只股票全部 801 行
-2023-03-29 ~ 2026-06-08
-
-news_data:
-覆盖到 2026-06-09
-新闻正文覆盖率约 50% ~ 70%
-
-sentiment_daily:
-覆盖到 2026-06-09
-
-model_feature_snapshots:
-7 只股票最新 base_trading_date 均为 2026-06-08
-features_json 中 daily_return / change_percent / amplitude 已和 price_data 对齐
-
-API 自动化测试:
-37 / 37 passed
+PySide6 桌面客户端
+        ↓ HTTP / JSON / JWT
+FastAPI 后端服务
+        ↓ SQLAlchemy / PyMySQL
+MySQL 数据库
+        ↓
+行情数据源 / 新闻数据源 / 模型文件 / LLM 服务
 ```
 
 ---
 
-### 1.4 仍需继续完善
+## 项目特色
 
-- 完整逐日回测交易引擎仍需进一步完善
-- 回测动画帧、逐日持仓、逐日交易、最终持仓仍需继续接入真实策略
-- 财报特征仍需要更严格的逐日生成逻辑
-- 外部数据源仍存在额度、限流、超时、403、付费 endpoint 等风险
-- 当前主分类模型本质为二分类模型，后端将其适配为 `prob_down / prob_neutral / prob_up`
-- 当前系统是日频预测系统，不是实时高频交易系统
+### 1. 行情、新闻、情绪与预测一体化
 
----
+系统不是只输出一个简单的“涨/跌”结果，而是同时展示股票行情、技术指标、新闻列表、新闻情绪、模型概率、推荐分数和解释报告，让用户能够从多个角度理解预测结果。
 
-## 2. 技术栈
+### 2. 新闻增强的股票预测
 
-| 类型             | 技术                         |
-| ---------------- | ---------------------------- |
-| Web 框架         | FastAPI                      |
-| 数据库           | MySQL 8.0                    |
-| ORM              | SQLAlchemy                   |
-| 数据库驱动       | PyMySQL                      |
-| 鉴权             | JWT                          |
-| 密码哈希         | passlib + bcrypt             |
-| 模型加载         | joblib                       |
-| 机器学习运行环境 | scikit-learn 1.8.0           |
-| 数据处理         | pandas / numpy               |
-| 外部请求         | requests                     |
-| 日频/分钟行情    | Twelve Data                  |
-| 新闻情绪         | Alpha Vantage News Sentiment |
-| LLM 报告         | 阿里云百炼 / DashScope       |
-| 部署             | Docker Compose               |
-| API 文档         | Swagger UI / OpenAPI         |
-| 语言             | Python 3.11                  |
+系统将新闻情绪与量价数据结合，使用特征快照、技术指标和新闻聚合结果构造模型输入。相比只看价格的简单预测，本项目更强调“新闻 + 量价”的融合分析。
 
-> 注意：B 同学交付的 v1.2 模型使用 scikit-learn 1.8.0 环境训练/保存。若运行环境低于该版本，可能出现模型反序列化 warning 或推理错误。
+### 3. LLM 中文解释报告
+
+模型本身负责数值预测，LLM 负责把结构化结果整理成更适合用户阅读的中文说明。即使 LLM 服务不可用，后端也会返回模板降级报告，保证前端流程不中断。
+
+### 4. 动态模拟回测
+
+回测不是一次性只返回最终收益，而是支持按交易日生成资金曲线、持仓快照、交易日志和事件日志。前端可以边拉取边播放，展示“每天发生了什么”。
+
+### 5. 用户端与管理员端分离
+
+普通用户关注股票、预测和回测；管理员负责用户管理、日志查看和数据任务状态检查。权限通过 JWT 和角色控制。
+
+### 6. Docker 化部署
+
+后端和 MySQL 可以通过 Docker Compose 一键启动，方便课程演示、服务器部署和团队协作。
 
 ---
 
-## 3. 项目结构
+## 系统能做什么
 
-```text
-finsight_backend/
-├── app/
-│   ├── main.py
-│   ├── core/
-│   │   ├── config.py
-│   │   ├── response.py
-│   │   └── security.py
-│   ├── db/
-│   │   ├── base.py
-│   │   ├── init_db.py
-│   │   └── session.py
-│   ├── models/
-│   │   └── all_models.py
-│   ├── schemas/
-│   │   ├── crawler.py
-│   │   ├── data_pipeline.py
-│   │   ├── prediction.py
-│   │   └── ...
-│   ├── routers/
-│   │   ├── auth.py
-│   │   ├── stocks.py
-│   │   ├── predictions.py
-│   │   ├── backtest.py
-│   │   ├── crawler.py
-│   │   ├── data_pipeline.py
-│   │   ├── logs.py
-│   │   └── ...
-│   ├── services/
-│   │   ├── twelvedata_market_service.py
-│   │   ├── market_data_service.py
-│   │   ├── intraday_market_service.py
-│   │   ├── news_service.py
-│   │   ├── news_detail_fetch_service.py
-│   │   ├── indicator_service.py
-│   │   ├── feature_snapshot_service.py
-│   │   ├── prediction_input_service.py
-│   │   ├── prediction_service.py
-│   │   ├── model_service.py
-│   │   ├── llm_service.py
-│   │   ├── data_pipeline_service.py
-│   │   ├── daily_refresh_service.py
-│   │   └── ...
-│   └── scripts/
-│       ├── create_intraday_price_data_table.py
-│       ├── run_twelvedata_incremental_refresh.py
-│       ├── ensure_ticker_data_on_demand.py
-│       ├── repair_price_derived_fields.py
-│       ├── delete_incomplete_intraday_rows.py
-│       ├── repair_feature_snapshots_from_price_data.py
-│       └── ...
-├── artifacts/
-│   └── models/
-├── docker/
-│   └── entrypoint.sh
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── run.py
-├── finsight_api_auto_test.py
-├── .env.example
-├── .env.docker.example
-├── .gitignore
-└── README.md
+### 普通用户功能
+
+| 功能       | 说明                                                  |
+| ---------- | ----------------------------------------------------- |
+| 注册与登录 | 使用账号登录系统，后端使用 JWT 鉴权                   |
+| 自选股管理 | 添加、删除、查看关注股票                              |
+| 股票搜索   | 根据股票代码或名称搜索证券基础库                      |
+| 股票详情   | 查看日频行情、1min 分钟行情、当前价格、涨跌幅和成交量 |
+| 技术指标   | 查看 MA、RSI、MACD 等指标曲线                         |
+| 新闻列表   | 查看股票相关新闻、来源、发布时间和摘要                |
+| 新闻详情   | 查看单条新闻详情、正文缓存和情绪结果                  |
+| 新闻情绪   | 查看 14 日新闻情绪统计和情绪曲线                      |
+| 单股预测   | 获取上涨/下跌概率、推荐分、预测价格路径和解释报告     |
+| 历史预测   | 查看自己的预测记录和预测详情                          |
+| 模拟回测   | 选择股票池和日期区间，运行历史模拟交易                |
+| 最终持仓   | 查看最近一次回测后的模拟持仓与盈亏                    |
+
+### 管理员功能
+
+| 功能         | 说明                                   |
+| ------------ | -------------------------------------- |
+| 用户列表     | 查看系统用户列表                       |
+| 用户详情     | 查看单个用户状态、角色和登录信息       |
+| 用户状态管理 | 启用、禁用或软删除用户                 |
+| 角色管理     | 调整用户角色                           |
+| 重置密码     | 管理员为用户重置密码                   |
+| 日志查询     | 查询登录、预测、回测、爬虫、异常等日志 |
+| 爬虫状态     | 查看每日刷新和股票基础库同步状态       |
+| 模型状态     | 查看当前 active 模型版本               |
+
+---
+
+## 使用流程
+
+### 面向普通用户
+
+1. 打开 Finsight 前端客户端。
+2. 注册或使用已有账号登录。
+3. 在自选股区域搜索并添加股票，例如 `AAPL`、`MSFT`、`NVDA`。
+4. 点击股票卡片，查看行情走势、技术指标和相关新闻。
+5. 点击预测按钮，系统会返回：
+   - 预测方向；
+   - 上涨/下跌概率；
+   - 推荐分数；
+   - 未来价格路径；
+   - 新闻情绪摘要；
+   - 中文解释报告。
+6. 进入回测页面，选择股票池、开始日期、结束日期和初始资金。
+7. 启动回测后，前端会动态展示每日资金曲线、买卖记录、持仓变化和最终收益。
+
+### 面向管理员
+
+1. 使用管理员账号登录。
+2. 进入管理员页面。
+3. 查看用户列表和用户详情。
+4. 根据需要禁用、启用、重置密码或修改角色。
+5. 查看操作日志、预测日志、回测日志和爬虫日志。
+6. 检查数据任务、模型状态和系统运行情况。
+
+---
+
+## 技术架构
+
+| 类别       | 技术                            |
+| ---------- | ------------------------------- |
+| 后端语言   | Python 3.11                     |
+| Web 框架   | FastAPI                         |
+| ASGI 服务  | Uvicorn                         |
+| 数据库     | MySQL 8.0                       |
+| ORM        | SQLAlchemy                      |
+| 数据库驱动 | PyMySQL                         |
+| 参数校验   | Pydantic v2                     |
+| 认证鉴权   | JWT + passlib + bcrypt          |
+| 数据处理   | pandas / numpy                  |
+| 机器学习   | scikit-learn / xgboost / joblib |
+| 行情数据   | Twelve Data / 其他备用数据服务  |
+| 新闻数据   | Alpha Vantage News Sentiment    |
+| LLM 报告   | 阿里云百炼 / DashScope          |
+| 部署方式   | Docker / Docker Compose         |
+| 客户端     | PySide6 桌面应用                |
+
+---
+
+## 当前版本
+
+当前后端版本：**v1.5**
+
+v1.5 主要能力如下：
+
+| 模块           | 状态   | 说明                                                        |
+| -------------- | ------ | ----------------------------------------------------------- |
+| 用户认证       | 已完成 | 注册、登录、JWT、当前用户信息                               |
+| 密码安全       | 已完成 | 前端 SHA-256 摘要，后端 bcrypt 存储                         |
+| 管理员用户管理 | 已完成 | 用户查询、禁用、启用、改名、改角色、重置密码、软删除        |
+| 股票基础库     | 已完成 | 支持 Nasdaq listed / other listed 股票基础库                |
+| 自选股         | 已完成 | 添加、删除、查询，支持 mini curve                           |
+| 股票详情       | 已完成 | 日频行情、1min 分钟行情、技术指标、新闻、情绪统计           |
+| 新闻数据       | 已完成 | 新闻列表、新闻详情、情绪分数和正文缓存                      |
+| 数据流水线     | 已完成 | market / technical / news / sentiment / features 模块化补齐 |
+| 模型预测       | 已完成 | 主分类、辅助强信号、回归路径三模型体系                      |
+| LLM 报告       | 已完成 | 百炼 / DashScope；失败时模板降级                            |
+| 模拟回测       | 已完成 | 异步逐日回测、frames、logs、summary、final positions        |
+| 日志系统       | 已完成 | 操作日志、预测日志、回测日志、爬虫日志查询                  |
+| 自动化测试     | 已完成 | 覆盖核心 API，跳过长耗时或高风险接口                        |
+
+---
+
+## 环境要求
+
+推荐使用 Docker 方式运行后端。
+
+### Docker 部署要求
+
+- Docker
+- Docker Compose
+- 可访问外部行情/新闻/LLM 服务的网络环境
+
+### 本地 Python 运行要求
+
+- Python 3.11
+- MySQL 8.0
+- pip / virtualenv
+
+---
+
+## 快速启动
+
+### 1. 克隆项目
+
+```bash
+git clone <your-repository-url>
+cd <your-backend-repository>
 ```
 
----
-
-## 4. 环境变量配置
-
-首次运行时复制环境变量模板：
+### 2. 准备环境变量
 
 ```bash
 cp .env.docker.example .env.docker
 ```
 
-Docker 内部后端连接 MySQL 必须使用服务名 `db`：
+然后编辑 `.env.docker`，至少确认以下配置：
 
 ```env
 DATABASE_URL=mysql+pymysql://finsight_user:finsight_password@db:3306/finsight?charset=utf8mb4
+SECRET_KEY=please-change-this-secret
+RUN_SEED=1
 ```
 
-不要写成：
+如需启用真实新闻、行情或 LLM 报告，请配置对应服务的 API Key。不要把真实 `.env` 文件提交到 GitHub。
 
-```env
-localhost:3306
-```
-
----
-
-### 4.1 推荐 `.env.docker`
-
-```env
-# =========================
-# Database
-# =========================
-DATABASE_URL=mysql+pymysql://finsight_user:finsight_password@db:3306/finsight?charset=utf8mb4
-
-# =========================
-# App
-# =========================
-SECRET_KEY=change-this-secret-key-in-real-deployment
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-PROJECT_NAME=Finsight Backend
-ENVIRONMENT=docker
-RUN_SEED=0
-
-# =========================
-# Core tickers
-# =========================
-FINSIGHT_CORE_TICKERS=AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META
-FINSIGHT_ENABLE_ON_DEMAND_INGEST=true
-
-# =========================
-# Twelve Data - market data
-# =========================
-TWELVEDATA_API_KEY=your_twelvedata_api_key
-TWELVEDATA_BASE_URL=https://api.twelvedata.com
-TWELVEDATA_TIMEZONE=America/New_York
-TWELVEDATA_DAILY_INTERVAL=1day
-TWELVEDATA_INTRADAY_INTERVAL=1min
-TWELVEDATA_DAILY_OUTPUTSIZE=5000
-TWELVEDATA_INTRADAY_OUTPUTSIZE=500
-TWELVEDATA_INTRADAY_PREPOST=false
-TWELVEDATA_TIMEOUT_SECONDS=30
-TWELVEDATA_REQUEST_SLEEP_SECONDS=1
-
-TWELVEDATA_DAILY_INITIAL_BACKFILL_DAYS=1260
-TWELVEDATA_INTRADAY_INITIAL_BACKFILL_DAYS=1
-
-# =========================
-# Alpha Vantage - news and fundamentals
-# =========================
-ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key
-NEWS_FETCH_LOOKBACK_DAYS=30
-NEWS_FETCH_LIMIT=1000
-NEWS_FETCH_TIMEOUT_SECONDS=30
-
-# =========================
-# LLM - Bailian / DashScope
-# =========================
-DASHSCOPE_API_KEY=your_dashscope_api_key
-BAILIAN_MODEL=qwen-plus
-BAILIAN_TIMEOUT_SECONDS=60
-
-# =========================
-# Daily automatic data refresh
-# =========================
-ENABLE_DAILY_AUTO_REFRESH=1
-DAILY_AUTO_REFRESH_HOUR=18
-DAILY_AUTO_REFRESH_MINUTE=30
-DAILY_AUTO_REFRESH_RUN_ON_STARTUP=0
-DAILY_AUTO_REFRESH_FORCE=0
-DAILY_AUTO_REFRESH_LIMIT=7
-DAILY_AUTO_REFRESH_TICKERS=AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META
-DAILY_AUTO_REFRESH_MODULES=market,intraday,technical,news,news_fulltext,sentiment,features
-DAILY_AUTO_REFRESH_NEWS_WINDOW_DAYS=14
-
-# =========================
-# Prediction on-demand pipeline
-# =========================
-PREDICTION_ON_DEMAND_PIPELINE=1
-PREDICTION_ON_DEMAND_MODULES=market,technical,news,news_fulltext,sentiment,features
-PREDICTION_ON_DEMAND_ALLOW_FALLBACK=1
-```
-
-修改 `.env.docker` 后重建容器配置：
+### 3. 启动服务
 
 ```bash
-docker compose up -d --force-recreate backend
+docker compose up -d --build
 ```
 
----
-
-## 5. Docker 启动方式
-
-### 5.1 启动服务
-
-```bash
-docker compose up -d
-```
-
-查看状态：
+### 4. 查看容器状态
 
 ```bash
 docker compose ps
 ```
 
-正常应类似：
-
-```text
-finsight_backend   Up   0.0.0.0:8002->8000/tcp
-finsight_mysql     Up   0.0.0.0:3308->3306/tcp
-```
-
-访问 API 文档：
-
-```text
-http://127.0.0.1:8002/docs
-```
-
-健康检查：
+### 5. 查看后端日志
 
 ```bash
-curl http://127.0.0.1:8002/health
+docker compose logs -f backend
 ```
 
----
-
-### 5.2 常用 Docker 命令
-
-只改 Python 代码：
+### 6. 测试健康检查
 
 ```bash
-docker compose restart backend
+curl http://localhost:8002/health
 ```
 
-改了 `.env.docker`：
-
-```bash
-docker compose up -d --force-recreate backend
-```
-
-改了 `docker-compose.yml`：
-
-```bash
-docker compose down
-docker compose up -d
-```
-
-改了 `requirements.txt`：
-
-```bash
-docker compose build backend
-docker compose up -d
-```
-
-依赖环境异常时：
-
-```bash
-docker compose build --no-cache backend
-docker compose up -d
-```
-
-查看后端日志：
-
-```bash
-docker compose logs --tail=120 backend
-```
-
----
-
-## 6. 数据表初始化与补全脚本
-
-### 6.1 创建分钟行情表
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.create_intraday_price_data_table"
-```
-
-### 6.2 运行 v1.5 增量数据补全
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh"
-```
-
-### 6.3 只刷新 features
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh --modules features --force-refresh"
-```
-
-### 6.4 只刷新最近完整交易日的分钟行情
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh --modules intraday"
-```
-
-系统默认使用 `price_data` 中每只股票的最新 `trading_date` 作为分钟行情目标日，避免抓取当天盘中残缺数据。
-
-### 6.5 指定日期刷新分钟行情
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh --modules intraday --target-date 2026-06-08"
-```
-
-### 6.6 修复日频派生字段
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.repair_price_derived_fields"
-```
-
-### 6.7 删除残缺分钟行情
-
-先 dry-run：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.delete_incomplete_intraday_rows --date 2026-06-09 --dry-run"
-```
-
-确认后执行：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.delete_incomplete_intraday_rows --date 2026-06-09"
-```
-
-### 6.8 修复特征快照中的行情派生字段
-
-只修最新 snapshot：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.repair_feature_snapshots_from_price_data --latest-only"
-```
-
-全量修复：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.repair_feature_snapshots_from_price_data"
-```
-
----
-
-## 7. 默认账号
-
-如果数据库已有 seed 或演示账号：
-
-```text
-管理员：admin / Admin123
-普通用户：user01 / User123
-```
-
-登录示例：
-
-```bash
-curl -X POST http://127.0.0.1:8002/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"Admin123"}'
-```
-
-获取 token：
-
-```bash
-ADMIN_TOKEN=$(curl -s -X POST http://127.0.0.1:8002/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"Admin123"}' \
-  | python -c "import sys,json; print(json.load(sys.stdin)['data']['token'])")
-```
-
----
-
-## 8. 当前主要 API 模块
-
-| 模块              | 前缀                 | 说明                                           |
-| ----------------- | -------------------- | ---------------------------------------------- |
-| Auth API          | `/api/auth`          | 注册、登录、当前用户                           |
-| Watchlist API     | `/api/watchlist`     | 自选股增删查                                   |
-| Stock API         | `/api/stocks`        | 股票搜索、详情、新闻、情绪摘要                 |
-| Prediction API    | `/api/predictions`   | 单股预测、预测历史、预测详情                   |
-| Backtest API      | `/api/backtest`      | 回测任务、状态、帧、日志、详情、汇总、最终持仓 |
-| Admin User API    | `/api/admin/users`   | 管理员用户管理                                 |
-| Log API           | `/api/logs`          | 管理员日志查询                                 |
-| Model Info API    | `/api/models`        | 当前启用模型查询                               |
-| Crawler API       | `/api/crawler`       | 股票基础库同步、每日数据补全兼容入口           |
-| Data Pipeline API | `/api/data-pipeline` | 数据覆盖检查和统一数据链路任务                 |
-
----
-
-## 9. 股票接口
-
-### 9.1 股票搜索
-
-```bash
-curl "http://127.0.0.1:8002/api/stocks/search?keyword=GOOGL&only_supported=false&include_etf=true&limit=10" \
-  -H "Authorization: Bearer $USER_TOKEN"
-```
-
-### 9.2 股票详情
-
-```bash
-curl "http://127.0.0.1:8002/api/stocks/AAPL/detail?range=1m&include_news=true&include_indicators=true&auto_refresh=false" \
-  -H "Authorization: Bearer $USER_TOKEN"
-```
-
-返回重点字段：
-
-```text
-current_quote.current_price
-current_quote.previous_close
-current_quote.change
-current_quote.change_percent
-current_quote.daily_return
-current_quote.amplitude
-price_curve
-indicator_curve
-latest_news
-sentiment_counts
-sentiment_summary
-```
-
-### 9.3 新闻列表
-
-```bash
-curl "http://127.0.0.1:8002/api/stocks/AAPL/news?limit=20" \
-  -H "Authorization: Bearer $USER_TOKEN"
-```
-
-支持滚动加载时，前端可传入时间范围、limit、cursor 等参数，具体以当前 `stocks.py` 路由实现为准。
-
-### 9.4 新闻详情
-
-```bash
-curl "http://127.0.0.1:8002/api/stocks/news/{news_id}" \
-  -H "Authorization: Bearer $USER_TOKEN"
-```
-
-新闻详情优先返回数据库中的正文缓存。若正文未抓取成功，可能返回摘要或抓取状态。
-
-### 9.5 14 日情绪摘要
-
-```bash
-curl "http://127.0.0.1:8002/api/stocks/AAPL/sentiment-summary?window_days=14" \
-  -H "Authorization: Bearer $USER_TOKEN"
-```
-
----
-
-## 10. Data Pipeline
-
-### 10.1 查询数据覆盖情况
-
-```bash
-curl "http://127.0.0.1:8002/api/data-pipeline/coverage?ticker=GOOGL&end_date=2026-06-08"
-```
-
-返回会展示：
-
-```text
-price_data
-technical_indicators
-news_data
-sentiment_daily
-model_feature_snapshots
-recommendation
-```
-
-常见状态：
-
-| 状态            | 含义                       |
-| --------------- | -------------------------- |
-| `ok`            | 已覆盖目标日期             |
-| `cached`        | 已有缓存，可直接使用       |
-| `stale`         | 有数据，但没有覆盖目标日期 |
-| `empty`         | 表存在，但该 ticker 无数据 |
-| `missing_table` | 表不存在                   |
-| `not_ready`     | 核心数据不足，需要补全     |
-| `ready`         | 核心数据可用于预测         |
-
----
-
-### 10.2 创建同步数据任务
-
-```bash
-curl -X POST http://127.0.0.1:8002/api/data-pipeline/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tickers": ["GOOGL"],
-    "end_date": "2026-06-08",
-    "modules": ["market", "intraday", "technical", "news", "news_fulltext", "sentiment", "features"],
-    "force_refresh": false,
-    "run_async": false
-  }'
-```
-
----
-
-### 10.3 命令行运行数据链路
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh \
---modules market,intraday,technical,news,news_fulltext,sentiment,features"
-```
-
-只跑新闻正文：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh --modules news_fulltext"
-```
-
----
-
-## 11. 预测接口
-
-### 11.1 自动使用最新可用交易日预测
-
-```bash
-curl -X POST http://127.0.0.1:8002/api/predictions/run \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $USER_TOKEN" \
-  -d '{
-    "ticker": "AAPL",
-    "forecast_days": 5,
-    "analysis_mode": "full",
-    "risk_profile": "balanced",
-    "news_window_days": 14,
-    "force_refresh": false
-  }'
-```
-
-### 11.2 指定基准日预测
-
-```bash
-curl -X POST http://127.0.0.1:8002/api/predictions/run \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $USER_TOKEN" \
-  -d '{
-    "ticker": "GOOGL",
-    "forecast_days": 5,
-    "base_trading_date": "2026-06-08",
-    "analysis_mode": "full",
-    "risk_profile": "balanced",
-    "news_window_days": 14,
-    "force_refresh": false
-  }'
-```
-
-含义：
-
-```text
-使用 base_trading_date 当天及之前的行情、技术指标、新闻情绪、财报特征作为输入，
-预测之后若干交易日的价格路径。
-```
-
-限制：
-
-```text
-当前 v1.2 回归模型最多输出未来 5 个交易日，因此 forecast_days 建议限制为 1~5。
-```
-
----
-
-### 11.3 预测前数据准备逻辑
-
-预测接口执行前会调用 `prediction_input_service.py`：
-
-```text
-1. 优先查 model_feature_snapshots 是否已有目标日期运行时快照；
-2. 如果有，直接使用数据库快照；
-3. 如果没有，自动调用 Data Pipeline：
-   market -> technical -> news -> news_fulltext -> sentiment -> features
-4. 如果目标日期无法准备，但存在更早可用快照，则根据 PREDICTION_ON_DEMAND_ALLOW_FALLBACK 决定是否降级；
-5. 返回 data_refresh_status 给前端。
-```
-
-前端应展示：
-
-```text
-requested_base_trading_date
-actual_base_trading_date
-base_trading_date_source
-warnings
-```
-
----
-
-### 11.4 预测返回关键字段
+预期返回：
 
 ```json
 {
-  "prediction_id": 37,
-  "ticker": "GOOGL",
-  "base_trading_date": "2026-06-08",
-  "forecast_days": 5,
-  "classification": {
-    "predicted_label": "down",
-    "prob_up": 0.0243211,
-    "prob_neutral": 0.0,
-    "prob_down": 0.975679
+  "success": true,
+  "data": {
+    "status": "ok"
   },
-  "regression": {
-    "price_path": []
-  },
-  "news_summary": {
-    "news_start_time": "2026-05-26",
-    "news_end_time": "2026-06-08",
-    "sentiment_curve": []
-  },
-  "llm_report": "..."
+  "message": "ok"
 }
 ```
 
-实际字段以当前 `schemas/prediction.py` 和路由返回为准。
+### 7. 访问接口文档
 
----
-
-## 12. 模型说明
-
-当前已接入 B 同学交付的 v1.2 模型：
-
-| 模型                              | 类型           | 说明                                                     |
-| --------------------------------- | -------------- | -------------------------------------------------------- |
-| `finsight_cls_abs_h15_v1.2`       | classifier     | 主分类模型，二分类输出，经后端适配为 down / neutral / up |
-| `finsight_cls_action1p5_h10_v1.2` | aux_classifier | 辅助强信号模型，用于推荐分数微调                         |
-| `finsight_reg_return_path_v1.2`   | regressor      | 回归路径模型，输出未来 5 个交易日收益率路径              |
-
-模型输入来自：
+启动后可在浏览器打开：
 
 ```text
-model_feature_snapshots.features_json
+http://localhost:8002/docs
 ```
 
-当前运行时快照包含约 52 个特征，主要包括：
+---
+
+## 环境变量说明
+
+常用环境变量如下：
+
+| 变量                            | 是否必填 | 说明                          |
+| ------------------------------- | -------- | ----------------------------- |
+| `DATABASE_URL`                  | 是       | 后端连接 MySQL 的地址         |
+| `SECRET_KEY`                    | 是       | JWT 签名密钥，部署时必须替换  |
+| `ACCESS_TOKEN_EXPIRE_MINUTES`   | 否       | Token 有效期                  |
+| `RUN_SEED`                      | 否       | 容器启动时是否导入演示数据    |
+| `ENABLE_DAILY_AUTO_REFRESH`     | 否       | 是否开启每日自动刷新          |
+| `DAILY_AUTO_REFRESH_TICKERS`    | 否       | 每日刷新股票池                |
+| `DAILY_AUTO_REFRESH_MODULES`    | 否       | 每日刷新模块                  |
+| `PREDICTION_ON_DEMAND_PIPELINE` | 否       | 预测前是否自动补齐数据        |
+| `PREDICTION_ON_DEMAND_MODULES`  | 否       | 预测前补齐模块                |
+| `ALPHA_VANTAGE_API_KEY`         | 可选     | 新闻和部分基础数据服务 Key    |
+| `TWELVE_DATA_API_KEY`           | 可选     | 分钟级行情服务 Key            |
+| `DASHSCOPE_API_KEY`             | 可选     | 百炼 / DashScope LLM 服务 Key |
+
+---
+
+## 数据库初始化
+
+### 自动初始化
+
+Docker 启动时，entrypoint 会等待 MySQL 就绪，然后启动 FastAPI。若设置：
+
+```env
+RUN_SEED=1
+```
+
+则会执行演示数据初始化脚本。
+
+### 手动进入数据库
+
+```bash
+docker compose exec db mysql -ufinsight_user -pfinsight_password finsight
+```
+
+### 常见核心表
+
+| 表名                       | 说明                           |
+| -------------------------- | ------------------------------ |
+| `roles`                    | 用户角色                       |
+| `users`                    | 用户账号、密码哈希、状态和角色 |
+| `stocks`                   | 股票基础库                     |
+| `watchlists`               | 用户自选股                     |
+| `price_data`               | 日频行情                       |
+| `intraday_price_data`      | 分钟级行情                     |
+| `news_data`                | 新闻、摘要、正文缓存和情绪结果 |
+| `technical_indicators`     | 技术指标                       |
+| `sentiment_daily`          | 每日新闻情绪聚合               |
+| `model_feature_snapshots`  | 模型特征快照                   |
+| `model_versions`           | 模型版本                       |
+| `predictions`              | 用户预测记录                   |
+| `backtest_runs`            | 回测任务                       |
+| `portfolio_snapshots`      | 回测资金曲线                   |
+| `backtest_daily_positions` | 回测每日持仓                   |
+| `backtest_event_logs`      | 回测事件日志                   |
+| `user_simulated_positions` | 用户最近回测最终模拟持仓       |
+| `operation_logs`           | 用户操作和系统日志             |
+| `crawler_logs`             | 爬虫日志                       |
+
+---
+
+## 主要 API 模块
+
+所有需要登录的接口都使用：
+
+```http
+Authorization: Bearer <token>
+```
+
+### 认证模块
+
+| 方法   | 路径                 | 说明             |
+| ------ | -------------------- | ---------------- |
+| `POST` | `/api/auth/register` | 用户注册         |
+| `POST` | `/api/auth/login`    | 用户登录         |
+| `GET`  | `/api/auth/me`       | 获取当前登录用户 |
+
+登录接口不接收明文密码。前端需要先计算：
 
 ```text
-行情特征：
-open / high / low / close / volume
-previous_close / change_amount / change_percent / daily_return / amplitude
+password_sha256 = sha256("FINSIGHT_CLIENT_PASSWORD_V1:" + raw_password)
+```
 
-技术指标：
-return_1d / return_3d / return_5d
-ma5 / ma20 / ma60
-ma5_gap / ma20_gap / ma60_gap
-rsi / macd
-volatility_20d / drawdown_20d / volume_zscore
+### 自选股模块
 
-新闻情绪：
-news_count
-positive_news_count / negative_news_count / neutral_news_count
-positive_ratio / negative_ratio
-sentiment_score
-sentiment_score_3d_avg / sentiment_score_7d_avg
+| 方法     | 路径                      | 说明           |
+| -------- | ------------------------- | -------------- |
+| `GET`    | `/api/watchlist`          | 获取自选股列表 |
+| `POST`   | `/api/watchlist`          | 添加自选股     |
+| `DELETE` | `/api/watchlist/{ticker}` | 删除自选股     |
 
-财报特征：
-fundamental_available
-fund_reported_eps / fund_estimated_eps / fund_eps_surprise / fund_eps_surprise_pct
-fund_total_revenue / fund_revenue_yoy
-fund_net_income / fund_net_income_yoy
-fund_gross_profit / fund_gross_margin
-fund_operating_income / fund_operating_margin
-fund_net_margin
-fund_report_age_days / fund_days_since_fiscal_end
+### 股票与新闻模块
+
+| 方法  | 路径                                     | 说明                           |
+| ----- | ---------------------------------------- | ------------------------------ |
+| `GET` | `/api/stocks/search`                     | 搜索股票                       |
+| `GET` | `/api/stocks/{ticker}/detail`            | 股票详情、行情、指标、新闻摘要 |
+| `GET` | `/api/stocks/{ticker}/news`              | 股票新闻列表                   |
+| `GET` | `/api/stocks/news/{news_id}`             | 新闻详情                       |
+| `GET` | `/api/stocks/{ticker}/sentiment-summary` | 新闻情绪摘要                   |
+
+### 预测模块
+
+| 方法   | 路径                               | 说明         |
+| ------ | ---------------------------------- | ------------ |
+| `POST` | `/api/predictions/run`             | 发起单股预测 |
+| `GET`  | `/api/predictions/history`         | 查询预测历史 |
+| `GET`  | `/api/predictions/{prediction_id}` | 查询预测详情 |
+
+### 回测模块
+
+| 方法   | 路径                                     | 说明                             |
+| ------ | ---------------------------------------- | -------------------------------- |
+| `POST` | `/api/backtest/run`                      | 创建回测任务                     |
+| `GET`  | `/api/backtest/{run_id}/status`          | 查询回测状态                     |
+| `GET`  | `/api/backtest/{run_id}/frames`          | 增量拉取回测帧                   |
+| `GET`  | `/api/backtest/{run_id}/logs`            | 查询回测日志                     |
+| `GET`  | `/api/backtest/{run_id}/summary`         | 查询回测汇总                     |
+| `GET`  | `/api/backtest/{run_id}/final-positions` | 查询某次回测最终持仓             |
+| `GET`  | `/api/backtest/latest/final-positions`   | 查询当前用户最近一次回测最终持仓 |
+
+### 管理员与运维模块
+
+| 方法     | 路径                                  | 说明                   |
+| -------- | ------------------------------------- | ---------------------- |
+| `GET`    | `/api/admin/users`                    | 用户列表               |
+| `GET`    | `/api/admin/users/{user_id}`          | 用户详情               |
+| `PUT`    | `/api/admin/users/{user_id}/status`   | 修改用户状态           |
+| `PUT`    | `/api/admin/users/{user_id}/role`     | 修改用户角色           |
+| `PUT`    | `/api/admin/users/{user_id}/username` | 修改用户名             |
+| `PUT`    | `/api/admin/users/{user_id}/password` | 重置密码               |
+| `DELETE` | `/api/admin/users/{user_id}`          | 软删除用户             |
+| `GET`    | `/api/logs`                           | 查询日志               |
+| `GET`    | `/api/models/active`                  | 查询当前 active 模型   |
+| `GET`    | `/api/crawler/status`                 | 查询爬虫状态           |
+| `GET`    | `/api/crawler/stock-universe/status`  | 查询股票基础库同步状态 |
+| `POST`   | `/api/crawler/stock-universe/sync`    | 同步股票基础库         |
+| `GET`    | `/api/crawler/daily-refresh/status`   | 查询每日刷新状态       |
+| `POST`   | `/api/crawler/daily-refresh/run`      | 执行每日刷新           |
+| `GET`    | `/api/data-pipeline/coverage`         | 查询数据覆盖情况       |
+| `POST`   | `/api/data-pipeline/jobs`             | 创建数据流水线任务     |
+
+---
+
+## 模型预测说明
+
+当前模型推理在后端完成，客户端不会直接加载模型。
+
+后端预测流程：
+
+```text
+用户点击预测
+→ 后端检查行情、新闻、技术指标和特征快照
+→ 若数据缺失，按配置触发数据流水线补齐
+→ 读取 active 模型版本
+→ 构造 50 维特征向量
+→ 主分类模型输出上涨/下跌倾向
+→ 辅助模型判断强信号
+→ 回归模型生成未来价格路径
+→ 计算 recommendation_score
+→ 生成新闻情绪摘要和中文解释报告
+→ 保存 predictions 记录
+→ 返回前端展示
+```
+
+当前 active 模型体系：
+
+| 模型角色       | version_name                      | algorithm           | horizon |
+| -------------- | --------------------------------- | ------------------- | ------: |
+| 主分类模型     | `finsight_cls_abs_h15_v1.2`       | LogisticRegression  |      15 |
+| 辅助强信号模型 | `finsight_cls_action1p5_h10_v1.2` | RidgeClassifier     |      10 |
+| 回归路径模型   | `finsight_reg_return_path_v1.2`   | ExtraTreesRegressor |       5 |
+
+预测返回结果包括：
+
+- 预测方向；
+- 上涨概率；
+- 下跌概率；
+- 推荐分数；
+- 推荐等级；
+- 未来价格路径；
+- 新闻情绪摘要；
+- 新闻影响说明；
+- 综合中文解释报告。
+
+---
+
+## 模拟回测说明
+
+回测用于回答：如果历史上按模型信号和策略规则进行模拟交易，组合表现如何。
+
+回测输入包括：
+
+| 参数                 | 说明                 |
+| -------------------- | -------------------- |
+| `tickers`            | 股票池               |
+| `start_date`         | 回测开始日期         |
+| `end_date`           | 回测结束日期         |
+| `initial_cash`       | 初始资金             |
+| `max_position_ratio` | 单只股票最大仓位比例 |
+| `max_holding_count`  | 最大同时持仓数量     |
+| `fee_rate`           | 交易手续费率         |
+| `take_profit_pct`    | 止盈比例             |
+| `stop_loss_pct`      | 止损比例             |
+
+回测执行方式：
+
+```text
+POST /api/backtest/run
+→ 后端创建 backtest_run
+→ BackgroundTasks 后台异步计算
+→ 每个交易日生成模型信号和策略动作
+→ 写入资金快照、持仓快照、交易记录和事件日志
+→ 前端轮询 status / frames / logs / summary
+→ 回测完成后查询 final positions
+```
+
+回测结果包括：
+
+- 总资产曲线；
+- 现金与股票市值；
+- 每日收益；
+- 总收益率；
+- 最大回撤；
+- 胜率；
+- 交易次数；
+- SPY 基准对比；
+- 每日持仓；
+- 买入/卖出日志；
+- 最终模拟持仓。
+
+---
+
+## 数据流水线与爬虫
+
+后端提供数据流水线，用于按股票和日期补齐数据。
+
+支持模块包括：
+
+```text
+market      日频行情
+intraday    分钟级行情
+technical   技术指标
+news        新闻数据
+sentiment   新闻情绪聚合
+features    模型特征快照
+```
+
+查询数据覆盖情况：
+
+```bash
+curl "http://localhost:8002/api/data-pipeline/coverage?ticker=AAPL"
+```
+
+创建数据流水线任务：
+
+```bash
+curl -X POST "http://localhost:8002/api/data-pipeline/jobs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ticker": "AAPL",
+    "target_date": "2026-06-12",
+    "modules": ["market", "technical", "features"]
+  }'
 ```
 
 ---
 
-## 13. 数据库表说明
+## 自动化测试
 
-### 13.1 当前核心表
+项目提供自动化测试脚本，用于验证主要 API 是否可用。
 
-| 表                        | 说明                            |
-| ------------------------- | ------------------------------- |
-| `users`                   | 用户账号                        |
-| `stocks`                  | 股票基础库                      |
-| `watchlists`              | 用户自选股                      |
-| `price_data`              | 日频 OHLCV 与涨跌幅派生字段     |
-| `intraday_price_data`     | 1min 分钟行情                   |
-| `technical_indicators`    | MA、RSI、MACD、波动率等技术指标 |
-| `news_data`               | 新闻标题、摘要、情绪、原文正文  |
-| `sentiment_daily`         | 按 ticker/date 聚合的新闻情绪   |
-| `model_feature_snapshots` | 模型运行时特征快照              |
-| `model_versions`          | 模型版本信息                    |
-| `predictions`             | 预测记录                        |
-| `crawler_logs`            | 爬虫与数据链路日志              |
-| `operation_logs`          | 用户与系统操作日志              |
-
-### 13.2 回测相关表
-
-| 表                         | 说明         |
-| -------------------------- | ------------ |
-| `backtest_runs`            | 回测任务     |
-| `backtest_event_logs`      | 回测事件日志 |
-| `portfolio_snapshots`      | 组合净值快照 |
-| `backtest_daily_positions` | 每日持仓     |
-| `backtest_trades`          | 回测交易记录 |
-| `user_simulated_positions` | 用户模拟持仓 |
-
-当前回测表结构和接口已存在，但完整逐日策略回测仍是后续重点。
-
----
-
-## 14. 数据库状态检查
-
-### 14.1 快速检查核心表覆盖
-
-```bash
-docker compose exec backend bash -lc 'PYTHONPATH=/app python - <<PY
-from sqlalchemy import text
-from app.db.session import SessionLocal
-
-TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META"]
-db = SessionLocal()
-
-for table, date_col in [
-    ("price_data", "trading_date"),
-    ("technical_indicators", "trading_date"),
-    ("sentiment_daily", "trading_date"),
-    ("model_feature_snapshots", "base_trading_date"),
-]:
-    print("\\n==", table, "==")
-    for ticker in TICKERS:
-        row = db.execute(text(f"""
-            SELECT COUNT(*) AS cnt, MIN({date_col}) AS min_date, MAX({date_col}) AS max_date
-            FROM {table}
-            WHERE ticker = :ticker
-        """), {"ticker": ticker}).mappings().first()
-        print(ticker, dict(row))
-
-print("\\n== intraday_price_data ==")
-for ticker in TICKERS:
-    row = db.execute(text("""
-        SELECT trading_date, COUNT(*) AS cnt, MIN(market_timestamp) AS min_ts, MAX(market_timestamp) AS max_ts
-        FROM intraday_price_data
-        WHERE ticker = :ticker
-        GROUP BY trading_date
-        ORDER BY trading_date DESC
-        LIMIT 1
-    """), {"ticker": ticker}).mappings().first()
-    print(ticker, dict(row) if row else None)
-
-db.close()
-PY'
-```
-
-### 14.2 检查最新 feature snapshot 派生字段
-
-```bash
-docker compose exec backend bash -lc 'PYTHONPATH=/app python - <<PY
-import json
-from sqlalchemy import text
-from app.db.session import SessionLocal
-
-TICKERS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META"]
-db = SessionLocal()
-
-for ticker in TICKERS:
-    row = db.execute(text("""
-        SELECT id, ticker, base_trading_date, current_price, features_json
-        FROM model_feature_snapshots
-        WHERE ticker = :ticker
-        ORDER BY base_trading_date DESC, id DESC
-        LIMIT 1
-    """), {"ticker": ticker}).mappings().first()
-
-    features = row["features_json"]
-    if isinstance(features, str):
-        features = json.loads(features)
-
-    print({
-        "ticker": ticker,
-        "base_trading_date": str(row["base_trading_date"]),
-        "current_price": float(row["current_price"]),
-        "feature_close": features.get("close"),
-        "feature_daily_return": features.get("daily_return"),
-        "feature_change_percent": features.get("change_percent"),
-        "feature_amplitude": features.get("amplitude"),
-    })
-
-db.close()
-PY'
-```
-
----
-
-## 15. API 自动化测试
-
-运行完整测试：
-
-```bash
-python finsight_api_auto_test.py --base-url http://127.0.0.1:8002
-```
-
-指定预测基准日：
+示例：
 
 ```bash
 python finsight_api_auto_test.py \
-  --base-url http://127.0.0.1:8002 \
-  --prediction-base-date 2026-06-08
+  --base-url http://localhost:8002 \
+  --admin-user admin \
+  --admin-pass Admin123 \
+  --user user01 \
+  --user-pass User123
 ```
 
-开启 Data Pipeline 测试：
-
-```bash
-python finsight_api_auto_test.py \
-  --base-url http://127.0.0.1:8002 \
-  --run-data-pipeline \
-  --pipeline-ticker GOOGL \
-  --pipeline-target-date 2026-06-08
-```
-
-测试报告输出：
+测试报告会输出为 JSON 和 Markdown，建议提交前至少确认：
 
 ```text
-api_test_results/
-├── finsight_api_test_report_时间戳.json
-└── finsight_api_test_report_时间戳.md
+核心接口通过
+没有 500 级错误
+登录、股票详情、预测、回测启动、日志、管理员查询均可用
 ```
 
 ---
 
-## 16. 数据备份与恢复
+## 项目目录结构
 
-### 16.1 备份
-
-```bash
-mkdir -p backups
-
-docker compose exec db sh -c \
-'mysqldump --no-tablespaces --single-transaction --quick --routines --triggers -ufinsight_user -pfinsight_password finsight' \
-> backups/finsight_backup_$(date +%Y%m%d_%H%M%S).sql
-```
-
-### 16.2 恢复
-
-```bash
-docker compose exec -T db mysql -ufinsight_user -pfinsight_password finsight < backups/你的备份文件.sql
+```text
+.
+├── app/
+│   ├── main.py                     # FastAPI 应用入口
+│   ├── core/                       # 配置、安全、响应、异常处理
+│   ├── db/                         # 数据库连接与初始化
+│   ├── models/                     # SQLAlchemy ORM 模型
+│   ├── routers/                    # FastAPI 路由
+│   ├── schemas/                    # Pydantic 请求/响应模型
+│   ├── services/                   # 业务逻辑、数据服务、模型服务、回测服务
+│   ├── scripts/                    # 数据导入、训练、修复和刷新脚本
+│   └── scripts_tmp/                # 临时维护脚本
+├── artifacts/
+│   └── models/                     # 后端加载的模型文件
+├── docker/
+│   └── entrypoint.sh               # Docker 启动脚本
+├── docs/                           # 项目说明文档
+├── tools/                          # 临时工具脚本
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── run.py
+├── finsight_api_auto_test.py
+├── .env.example
+├── .env.docker.example
+└── README.md
 ```
 
 ---
 
-## 17. Git 协作建议
+## 常见问题
 
-### 17.1 切换到 v1.5 分支
+### 1. 后端启动后访问不了接口
 
-```bash
-git fetch origin
-git switch v1.5 || git switch -c v1.5 origin/v1.5 || git switch -c v1.5
-```
-
-### 17.2 提交当前 v1.5 hotfix
+先检查容器状态：
 
 ```bash
-git status
-
-git add app/core/config.py
-git add app/models/all_models.py
-git add app/services/twelvedata_market_service.py
-git add app/services/market_data_service.py
-git add app/services/intraday_market_service.py
-git add app/services/data_pipeline_service.py
-git add app/services/daily_refresh_service.py
-git add app/services/feature_snapshot_service.py
-git add app/scripts/create_intraday_price_data_table.py
-git add app/scripts/run_twelvedata_incremental_refresh.py
-git add app/scripts/ensure_ticker_data_on_demand.py
-git add app/scripts/repair_price_derived_fields.py
-git add app/scripts/delete_incomplete_intraday_rows.py
-git add app/scripts/repair_feature_snapshots_from_price_data.py
-git add README.md
-
-git commit -m "fix(data): stabilize v1.5 Twelve Data pipeline and feature snapshots"
-git push -u origin v1.5
+docker compose ps
 ```
 
-### 17.3 不建议提交
+再查看日志：
+
+```bash
+docker compose logs -f backend
+```
+
+确认后端是否绑定到宿主机 `8002` 端口。
+
+### 2. 数据库连接失败
+
+检查 `.env.docker` 中的 `DATABASE_URL` 是否与 `docker-compose.yml` 中的数据库账号、密码、库名一致。
+
+### 3. 登录失败
+
+新版登录接口不接受明文 `password` 字段，必须提交 `password_sha256`。前端输入原始密码后，会自动计算摘要再提交。
+
+### 4. 预测很慢
+
+预测可能触发数据补齐、模型加载和 LLM 报告生成。首次预测通常会比后续预测更慢。若 LLM 服务不可用，后端会使用模板报告降级。
+
+### 5. 回测启动后没有马上完成
+
+回测是后台异步任务。前端需要轮询：
 
 ```text
-__pycache__/
-*.pyc
-.env
-.env.docker
-api_test_results/
-backups/
-mysql_data/
-logs/
-.venv/
-venv/
-*.db
-*.sqlite
-local_experiments/
-external_data/
-import_data/
+/api/backtest/{run_id}/status
+/api/backtest/{run_id}/frames
+/api/backtest/{run_id}/logs
 ```
 
-### 17.4 可以提交
+### 6. 新闻或分钟行情为空
 
-```text
-app/
-artifacts/models/
-docker/
-Dockerfile
-docker-compose.yml
-requirements.txt
-run.py
-README.md
-.env.example
-.env.docker.example
-.gitignore
-finsight_api_auto_test.py
-```
+可能原因包括：
+
+- 外部 API Key 未配置；
+- 当前股票没有对应数据；
+- 数据流水线尚未运行；
+- 外部数据源达到调用限制。
 
 ---
 
-## 18. 常见问题
+## 开发建议
 
-### 18.1 后端一直重启
+### 本地开发
 
 ```bash
-docker compose logs --tail=120 backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python run.py
 ```
 
-### 18.2 8002 端口被占用
+Windows PowerShell：
 
-修改 `docker-compose.yml`：
-
-```yaml
-ports:
-  - "8003:8000"
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python run.py
 ```
 
-然后：
+### 重新构建 Docker
 
 ```bash
 docker compose down
-docker compose up -d
+docker compose up -d --build
 ```
 
-### 18.3 修改 Python 代码没生效
+### 查看数据库表
 
 ```bash
-docker compose restart backend
+docker compose exec db mysql -ufinsight_user -pfinsight_password finsight -e "SHOW TABLES;"
 ```
-
-如果没有 volume 挂载，才需要重新 build。
-
-### 18.4 `.env.docker` 修改没生效
-
-```bash
-docker compose up -d --force-recreate backend
-```
-
-### 18.5 日频涨跌幅变成 0 或 NULL
-
-先修复 `price_data`：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.repair_price_derived_fields"
-```
-
-再修复 feature snapshot：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.repair_feature_snapshots_from_price_data --latest-only"
-```
-
-### 18.6 分钟行情只有几十条
-
-说明抓到了当天盘中残缺数据。删除残缺交易日后，重新抓最近完整交易日：
-
-```bash
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.delete_incomplete_intraday_rows --date 2026-06-09"
-
-docker compose exec backend bash -lc \
-"PYTHONPATH=/app python -m app.scripts.run_twelvedata_incremental_refresh --modules intraday"
-```
-
-### 18.7 预测日期为什么不是今天
-
-模型是日频模型，输入需要完整交易日收盘后的特征。如果今天没有完整收盘行情，系统会使用最近一个完整交易日作为 `actual_base_trading_date`。
-
-### 18.8 LLM 报告失败
-
-检查：
-
-```text
-DASHSCOPE_API_KEY 是否配置
-BAILIAN_MODEL 是否可用
-网络是否能访问 DashScope
-后端日志是否有 timeout 或 unauthorized
-```
-
-LLM 失败时，预测主流程不应中断，应返回模板降级报告或错误说明。
 
 ---
 
-## 19. 当前待开发重点
+## 安全与免责声明
 
-建议后续按优先级推进：
-
-1. **完整逐日回测引擎**
-   - 逐日交易循环
-   - 买入 / 卖出 / 持有决策
-   - 持仓与现金更新
-   - 回测动画帧
-   - 交易日志
-   - 最终持仓
-
-2. **前端回测动画数据完全接入**
-   - 组合净值曲线
-   - 每日新闻
-   - 每日指标
-   - 每日交易动作
-   - 最终持仓展示
-
-3. **财报特征更严格生成**
-   - 从财报表或在线财报接口生成逐日 `fund_*`
-   - 替代简单 carry-forward
-   - 明确财报发布日期与可见性，避免未来函数
-
-4. **数据质量面板**
-   - 每只股票最新行情日期
-   - 最新分钟行情日期
-   - 最新 feature snapshot 日期
-   - 新闻覆盖日期
-   - 新闻正文覆盖率
-   - 抓取失败原因统计
-
-5. **数据源稳定性**
-   - Twelve Data 限流处理
-   - Alpha Vantage 限流处理
-   - 失败重试与退避
-   - 付费数据源替换预留
+- `.env`、`.env.docker`、API Key、数据库密码不得提交到 GitHub。
+- `password_sha256` 虽然不是明文密码，但仍等价于登录凭证，正式部署必须使用 HTTPS。
+- 本系统是课程实践和原型展示项目，不接入真实券商账户。
+- 系统不执行真实交易，不保存真实证券账户信息。
+- 所有预测、推荐分、情绪分析和回测结果仅供学习和实验参考，不构成投资建议。
+- 历史回测收益不代表未来表现。
 
 ---
 
-## 20. 项目定位总结
+## 版本总结
 
-当前版本是：
-
-```text
-Finsight Backend v1.5：
-FastAPI + MySQL + Docker + v1.2 三模型推理
-+ 百炼 LLM 报告
-+ Twelve Data 日频/分钟行情
-+ Alpha Vantage 新闻情绪
-+ 新闻正文抓取
-+ 52 维运行时特征快照
-+ 数据库优先补全
-+ 按需预测数据准备
-+ 每日自动补全调度
-```
-
-已经适合：
+Finsight Backend v1.5 已经形成较完整的后端闭环：
 
 ```text
-前端联调
-用户系统
-股票搜索与详情
-新闻列表与新闻详情
-预测页面
-预测历史
-LLM 综合解释报告
-模型版本展示
-Data Pipeline 验证
-每日数据补全任务测试
-日志页面
-基础回测接口联调
+用户登录
+→ 自选股管理
+→ 股票行情与新闻展示
+→ 新闻情绪分析
+→ 机器学习预测
+→ LLM 中文解释
+→ 模拟回测
+→ 最终持仓与日志记录
+→ 管理员运维查看
 ```
 
-仍需继续完善：
-
-```text
-真实逐日回测交易引擎
-更严格的财报特征
-更稳定的数据源治理
-数据质量可视化面板
-```
+该版本适合作为课程项目展示、GitHub 项目说明和后续功能迭代的基础版本。

@@ -51,6 +51,15 @@ from app.services.model_service import (
     predict_regressor,
 )
 
+# Backtest strategy fixed server-side thresholds.
+# These values come from threshold optimization result:
+# scan_20260615_160731 / best_params.json
+OPTIMAL_BUY_SCORE_THRESHOLD = 50.0
+OPTIMAL_BUY_SITUATION_THRESHOLD = 45.0
+
+DEFAULT_SELL_SCORE_THRESHOLD = 42.0
+DEFAULT_MIN_CASH_RESERVE_RATIO = 0.02
+
 
 @dataclass
 class RuntimePosition:
@@ -194,14 +203,19 @@ def _current_price(row: PriceData | None) -> float | None:
         return None
     return _safe_float(row.close if row.close is not None else row.adj_close)
 
-
 def _get_strategy_params(run: BacktestRun) -> dict[str, Any]:
     """集中读取策略参数，并给旧数据补默认值。
 
     用户当前只允许修改：
     max_position_ratio、max_holding_count、fee_rate、take_profit_pct、stop_loss_pct。
 
-    其他策略参数统一由后端默认值控制。
+    buy_score_threshold / buy_situation_threshold 是后端固定策略参数，
+    普通 API 不开放给用户修改。
+
+    注意：
+    这里使用 setdefault，而不是强制覆盖，是为了保留内部扫参脚本
+    optimize_backtest_thresholds.py 传入不同 threshold 的能力。
+    普通用户创建的新回测会在 create_backtest_run() 中固定写入最优参数。
     """
     params = dict(run.strategy_params_json or {})
 
@@ -217,13 +231,15 @@ def _get_strategy_params(run: BacktestRun) -> dict[str, Any]:
     params.setdefault("save_daily_positions", True)
     params.setdefault("save_event_logs", True)
     params.setdefault("animation_mode", "fast")
-    params.setdefault("buy_score_threshold", 54.0)
-    params.setdefault("buy_situation_threshold", 59.0)
-    params.setdefault("sell_score_threshold", 42.0)
-    params.setdefault("min_cash_reserve_ratio", 0.02)
+
+    # 最优买入阈值，来自粗扫结果 scan_20260615_160731。
+    params.setdefault("buy_score_threshold", OPTIMAL_BUY_SCORE_THRESHOLD)
+    params.setdefault("buy_situation_threshold", OPTIMAL_BUY_SITUATION_THRESHOLD)
+
+    params.setdefault("sell_score_threshold", DEFAULT_SELL_SCORE_THRESHOLD)
+    params.setdefault("min_cash_reserve_ratio", DEFAULT_MIN_CASH_RESERVE_RATIO)
 
     return params
-
 
 def create_backtest_run(db: Session, user_id: int, req: BacktestRunRequest) -> BacktestRun:
     """创建回测任务。
@@ -259,10 +275,13 @@ def create_backtest_run(db: Session, user_id: int, req: BacktestRunRequest) -> B
             "save_daily_positions": True,
             "save_event_logs": True,
             "animation_mode": "fast",
-            "buy_score_threshold": 54.0,
-            "buy_situation_threshold": 59.0,
-            "sell_score_threshold": 42.0,
-            "min_cash_reserve_ratio": 0.02,
+
+            # 最优买入阈值，来自粗扫结果 scan_20260615_160731。
+            "buy_score_threshold": OPTIMAL_BUY_SCORE_THRESHOLD,
+            "buy_situation_threshold": OPTIMAL_BUY_SITUATION_THRESHOLD,
+
+            "sell_score_threshold": DEFAULT_SELL_SCORE_THRESHOLD,
+            "min_cash_reserve_ratio": DEFAULT_MIN_CASH_RESERVE_RATIO,
         },
         status="pending",
         progress=0.0,
